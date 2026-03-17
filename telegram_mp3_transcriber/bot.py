@@ -46,6 +46,43 @@ def _get_user_quality(user_id: int) -> str:
     return user_quality.get(user_id, "balanced")
 
 
+def _find_dll_on_path(dll_name: str) -> str | None:
+    for path_item in os.environ.get("PATH", "").split(os.pathsep):
+        if not path_item:
+            continue
+        candidate = Path(path_item) / dll_name
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _prepend_paths(paths: list[str]) -> None:
+    current = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    current_lower = {p.lower() for p in current}
+    to_add = []
+    for path in paths:
+        normalized = str(Path(path))
+        if Path(normalized).exists() and normalized.lower() not in current_lower:
+            to_add.append(normalized)
+            current_lower.add(normalized.lower())
+    if to_add:
+        os.environ["PATH"] = os.pathsep.join(to_add + current)
+        logger.info("Added %d CUDA/CUDNN path(s) to PATH for this bot process.", len(to_add))
+
+
+def _configure_cuda_paths() -> None:
+    env_extra = os.getenv("CUDA_EXTRA_PATHS", "").strip()
+    user_paths = [p.strip() for p in env_extra.split(";") if p.strip()] if env_extra else []
+
+    auto_paths: list[str] = [
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin\x64",
+        r"C:\Program Files\NVIDIA\CUDNN\v9.20\bin\12.9\x64",
+    ]
+
+    _prepend_paths(user_paths + auto_paths)
+
+
 def _settings_text(user_id: int) -> str:
     lang = _get_user_language(user_id)
     quality = _get_user_quality(user_id)
@@ -135,6 +172,29 @@ def _split_for_telegram(text: str, max_chars: int = 3900) -> list[str]:
     return chunks
 
 
+def _format_gpu_status(transcriber: SpeechTranscriber) -> str:
+    status = transcriber.status()
+    model_loaded = "yes" if status["model_loaded"] else "no"
+    loading = "yes" if status["loading"] else "no"
+    state = "CUDA active" if status["active_device"] == "cuda" else "CPU mode active"
+    cublas = _find_dll_on_path("cublas64_12.dll") or "not found"
+    cudnn = _find_dll_on_path("cudnn64_9.dll") or "not found"
+    return (
+        "Runtime status:\n"
+        f"Model: {status['model_size']}\n"
+        f"Requested device: {status['requested_device']}\n"
+        f"Active device: {status['active_device']}\n"
+        f"Requested compute: {status['requested_compute_type']}\n"
+        f"Active compute: {status['active_compute_type']}\n"
+        f"Model loaded: {model_loaded}\n"
+        f"Loading now: {loading}\n"
+        f"cublas64_12.dll: {cublas}\n"
+        f"cudnn64_9.dll: {cudnn}\n"
+        f"State: {state}\n\n"
+        "If active device is cpu while requested is cuda, CPU fallback is active."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     message = update.effective_message
@@ -144,7 +204,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await message.reply_text(
         "Send me an MP3/audio file and I will convert speech to text.\n"
-        "Use /help for interactive settings menu."
+        "Use /help for interactive settings menu.\n"
+        "Use /gpu to check CUDA/CPU runtime status.\n"
+        "First transcription may take several minutes while model downloads/loads."
     )
     await _send_menu(message, user.id)
 
@@ -161,7 +223,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/help - open settings menu\n"
         "/settings - open settings menu\n"
         "/lang auto|ru|en\n"
-        "/quality fast|balanced|best\n\n"
+        "/quality fast|balanced|best\n"
+        "/gpu - show runtime device status\n\n"
         "Send audio as voice, audio, or file attachment."
     )
     await _send_menu(message, user.id)
@@ -190,7 +253,8 @@ async def text_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "EN:\n"
         "I transcribe speech from audio files.\n"
         "Please send an MP3/audio/voice message.\n\n"
-        "Use /help for settings."
+        "Use /help for settings.\n"
+        "Use /gpu to check runtime device."
     )
     await _send_menu(message, user.id)
 
@@ -235,6 +299,19 @@ async def set_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_quality[user.id] = chosen
     await message.reply_text(f"Quality mode set to: {chosen}")
     await _send_menu(message, user.id)
+
+
+async def gpu_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    transcriber: SpeechTranscriber = context.application.bot_data.get("transcriber")
+    if transcriber is None:
+        await message.reply_text("Transcriber is not initialized yet.")
+        return
+
+    await message.reply_text(_format_gpu_status(transcriber))
 
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -309,7 +386,16 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             input_path = tmp_path / f"input{file_ext}"
             await tg_file.download_to_drive(custom_path=str(input_path))
 
-            await progress.edit_text(f"Transcribing... (quality={quality}, language={language})")
+            if not transcriber.is_model_loaded():
+                await progress.edit_text(
+                    "Preparing model for first run (download + load). "
+                    "Please wait, this can take a few minutes..."
+                )
+            else:
+                await progress.edit_text(
+                    f"Transcribing... (quality={quality}, language={language})"
+                )
+
             result = await asyncio.to_thread(
                 transcriber.transcribe_file,
                 input_path,
@@ -317,10 +403,12 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 quality,
             )
 
+            runtime = transcriber.status()
             summary = (
                 f"Done.\n"
                 f"Detected language: {result.language}\n"
                 f"Quality mode: {quality}\n"
+                f"Device: {runtime['active_device']}\n"
                 f"Chunks used: {result.chunk_count}"
             )
 
@@ -347,6 +435,7 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 def main() -> None:
     load_dotenv()
+    _configure_cuda_paths()
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN in environment or .env file.")
@@ -363,7 +452,10 @@ def main() -> None:
     vad_filter = _env_bool("WHISPER_VAD_FILTER", False)
     condition_on_previous_text = _env_bool("WHISPER_CONDITION_ON_PREVIOUS_TEXT", False)
 
-    logger.info("Loading model '%s'...", model_size)
+    logger.info(
+        "Initializing bot (model '%s' will load lazily on first transcription request).",
+        model_size,
+    )
     transcriber = SpeechTranscriber(
         model_size=model_size,
         device=device,
@@ -377,7 +469,7 @@ def main() -> None:
         vad_filter=vad_filter,
         condition_on_previous_text=condition_on_previous_text,
     )
-    logger.info("Model loaded. Bot is starting.")
+    logger.info("Bot is starting.")
 
     app = Application.builder().token(token).build()
     app.bot_data["transcriber"] = transcriber
@@ -387,7 +479,13 @@ def main() -> None:
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("lang", set_language))
     app.add_handler(CommandHandler("quality", set_quality))
-    app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(lang:|quality:|settings:)"))
+    app.add_handler(CommandHandler("gpu", gpu_status_command))
+    app.add_handler(
+        CallbackQueryHandler(
+            settings_callback,
+            pattern=r"^(lang:|quality:|settings:)",
+        )
+    )
     app.add_handler(
         MessageHandler(
             filters.AUDIO | filters.VOICE | filters.Document.AUDIO,

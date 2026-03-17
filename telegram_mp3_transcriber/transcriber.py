@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import threading
 from typing import Any
 
 from faster_whisper import WhisperModel
@@ -37,14 +38,15 @@ class SpeechTranscriber:
         condition_on_previous_text: bool = False,
     ) -> None:
         self.model_size = model_size
+        self.requested_device = device
+        self.requested_compute_type = compute_type
         self.device = device
         self.compute_type = compute_type
 
-        self.model = WhisperModel(
-            model_size_or_path=model_size,
-            device=device,
-            compute_type=compute_type,
-        )
+        self.model: WhisperModel | None = None
+        self._model_lock = threading.Lock()
+        self._loading = False
+
         self.target_chunk_mb = target_chunk_mb
         self.max_chunk_seconds = max_chunk_seconds
         self.chunk_overlap_seconds = chunk_overlap_seconds
@@ -60,14 +62,77 @@ class SpeechTranscriber:
         needles = ("cublas", "cudnn", "cuda", "onnxruntime_providers_cuda")
         return any(needle in msg for needle in needles)
 
-    def _reload_on_cpu(self) -> None:
-        self.model = WhisperModel(
-            model_size_or_path=self.model_size,
-            device="cpu",
-            compute_type="int8",
+    def is_model_loaded(self) -> bool:
+        return self.model is not None
+
+    def is_loading(self) -> bool:
+        return self._loading
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "model_size": self.model_size,
+            "requested_device": self.requested_device,
+            "requested_compute_type": self.requested_compute_type,
+            "active_device": self.device,
+            "active_compute_type": self.compute_type,
+            "model_loaded": self.is_model_loaded(),
+            "loading": self.is_loading(),
+        }
+
+    def ensure_model_loaded(self) -> None:
+        if self.model is not None:
+            return
+
+        with self._model_lock:
+            if self.model is not None:
+                return
+
+            self._loading = True
+            try:
+                self._load_model_with_fallback()
+            finally:
+                self._loading = False
+
+    def _load_model_with_fallback(self) -> None:
+        logger.info(
+            "Loading whisper model '%s' on device=%s (compute=%s)...",
+            self.model_size,
+            self.device,
+            self.compute_type,
         )
-        self.device = "cpu"
-        self.compute_type = "int8"
+        try:
+            self.model = WhisperModel(
+                model_size_or_path=self.model_size,
+                device=self.device,
+                compute_type=self.compute_type,
+            )
+            logger.info("Whisper model is ready.")
+        except RuntimeError as exc:
+            if self._is_cuda_runtime_error(exc) and self.device != "cpu":
+                logger.warning(
+                    "CUDA runtime is not available (%s). Falling back to CPU int8.",
+                    exc,
+                )
+                self.device = "cpu"
+                self.compute_type = "int8"
+                self.model = WhisperModel(
+                    model_size_or_path=self.model_size,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                )
+                logger.info("Whisper model is ready on CPU fallback.")
+                return
+            raise
+
+    def _reload_on_cpu(self) -> None:
+        with self._model_lock:
+            self.device = "cpu"
+            self.compute_type = "int8"
+            self.model = WhisperModel(
+                model_size_or_path=self.model_size,
+                device=self.device,
+                compute_type=self.compute_type,
+            )
 
     @staticmethod
     def _merge_chunk_texts(chunk_texts: list[str]) -> str:
@@ -133,6 +198,9 @@ class SpeechTranscriber:
         language: str,
         quality_profile: str | None,
     ) -> TranscriptionResult:
+        if self.model is None:
+            raise RuntimeError("Model is not loaded.")
+
         chunk_texts: list[str] = []
         detected_languages: list[str] = []
         decode_options = self._decode_options(quality_profile)
@@ -184,6 +252,8 @@ class SpeechTranscriber:
         if not input_file.exists():
             raise FileNotFoundError(f"Audio file not found: {input_file}")
 
+        self.ensure_model_loaded()
+
         audio = decode_audio_mono(input_file, sampling_rate=SAMPLE_RATE)
         chunks = split_audio_by_limits(
             audio,
@@ -203,7 +273,7 @@ class SpeechTranscriber:
         except RuntimeError as exc:
             if self._is_cuda_runtime_error(exc) and self.device != "cpu":
                 logger.warning(
-                    "CUDA runtime not available (%s). Falling back to CPU mode.",
+                    "CUDA runtime failed during transcription (%s). Falling back to CPU mode.",
                     exc,
                 )
                 self._reload_on_cpu()
