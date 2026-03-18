@@ -1,0 +1,4 @@
+# Optional dependencies for NeMo diarization backend.
+# If installation fails on Python 3.14, use a Python 3.11/3.12 environment for NeMo.
+nemo_toolkit[asr]
+omegaconf>=2.3.0

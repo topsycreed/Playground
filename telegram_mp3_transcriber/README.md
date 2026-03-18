@@ -1,11 +1,21 @@
 # Telegram MP3 -> Text Bot (RU/EN, free, local)
 
+## Quick Start
+
+```powershell
+cd .\telegram_mp3_transcriber\
+.\.venv312\Scripts\Activate.ps1
+python bot.py
+```
+
 This bot transcribes speech from Telegram audio files to text using `faster-whisper` (local inference, no paid API).
 
 Features:
 - Russian (`ru`), English (`en`), Auto language detection (`auto`)
 - Interactive Telegram settings menu (`/help` or `/settings`)
 - Quality profiles (`fast`, `balanced`, `best`)
+- Output formats: plain text or dialogue (`User1` / `User2`)
+- Hybrid mode: Whisper transcription + optional NeMo diarization backend
 - Large-file handling: split into chunks + automatic text merge
 - GPU (CUDA) acceleration with automatic CPU fallback
 - Lazy model loading: bot starts immediately; model downloads/loads on first transcription
@@ -25,7 +35,7 @@ Recommended (GPU mode, better speed/quality):
 ## Software Requirements
 
 - Windows 10/11 (PowerShell commands below target Windows)
-- Python 3.10+ (project is running on Python 3.14 in this workspace)
+- Python 3.10+ for Whisper bot
 - Internet access on first model download
 - Telegram bot token from `@BotFather`
 
@@ -33,6 +43,11 @@ For CUDA mode only:
 - NVIDIA driver (latest stable)
 - CUDA Toolkit 12.x
 - cuDNN 9.x for CUDA 12
+
+For NeMo diarization backend:
+- `nemo_toolkit[asr]` dependencies (see `requirements-nemo.txt`)
+- Recommended Python version: 3.11 or 3.12
+- On Python 3.13+ (including 3.14), NeMo is often unavailable in this setup; bot will auto-fallback to heuristic diarization
 
 ## 1) Create Telegram Bot Token
 
@@ -53,6 +68,22 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+Optional for NeMo diarization:
+
+```powershell
+pip install -r requirements-nemo.txt
+```
+
+If NeMo install fails in your current environment (common on Python 3.13+), create a Python 3.12 venv:
+
+```powershell
+py -3.12 -m venv .venv312
+.venv312\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install -r requirements-nemo.txt
+```
+
 ## 3) Configure `.env`
 
 ```powershell
@@ -70,6 +101,16 @@ Optional if CUDA DLLs are not auto-detected:
 ```env
 CUDA_EXTRA_PATHS=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin;C:\Program Files\NVIDIA\CUDNN\v9.20\bin\12.9\x64
 ```
+
+NeMo diarization options:
+
+```env
+DIARIZATION_BACKEND=nemo
+NEMO_NUM_SPEAKERS=0
+NEMO_NUM_WORKERS=0
+```
+
+`NEMO_NUM_WORKERS=0` is recommended on Windows to avoid multiprocessing/pickling errors during NeMo diarization.
 
 ## 4) Enable CUDA (NVIDIA GPU) on Windows
 
@@ -108,6 +149,27 @@ If `where` does not find DLLs, add CUDA `bin` to system `PATH` (then open a new 
 ```
 
 If this fails with `cublas64_12.dll` or `cudnn64_9.dll`, CUDA/cuDNN install or PATH is incomplete.
+
+## 4.1) FFmpeg (required by NeMo/pydub path)
+
+Install (if not installed):
+
+```powershell
+winget install Gyan.FFmpeg
+```
+
+Verify:
+
+```powershell
+where.exe ffmpeg
+where.exe ffprobe
+```
+
+If not found, set in `.env`:
+
+```env
+FFMPEG_EXTRA_PATHS=C:\path\to\ffmpeg\bin
+```
 
 ## 5) Recommended `.env` Profiles
 
@@ -150,11 +212,71 @@ They are cached locally, so re-download is not needed every start (unless cache 
 - `/help` or `/settings` opens interactive menu
 - Menu language options: `auto`, `ru`, `en`
 - Menu quality options: `fast`, `balanced`, `best`
+- Menu format options: `text`, `dialog`
+- Menu diarization options: `auto`, `nemo`, `heuristic`
+- Menu speaker options: `auto`, `2`, `3`, `4`
 - Text commands also work:
 `/lang auto|ru|en`
 `/quality fast|balanced|best`
-`/gpu` (show current model/device/compute runtime status)
+`/format text|dialog`
+`/diar auto|nemo|heuristic`
+`/speakers auto|2|3|4`
+`/gpu` (show current model/device/compute runtime status, including NeMo availability)
 - `/gpu` also reports if `cublas64_12.dll` and `cudnn64_9.dll` are visible in PATH
+
+## 8) Large Files (up to 300 MB and more)
+
+Telegram cloud Bot API limits bot downloads to 20 MB.  
+For large files, run a local Telegram Bot API server.
+
+According to official docs, local mode allows:
+- Download files without a size limit
+- Upload files up to 2000 MB
+
+Sources:
+- [Telegram Bot API](https://core.telegram.org/bots/api)
+- [tdlib/telegram-bot-api](https://github.com/tdlib/telegram-bot-api)
+
+Bot `.env` settings for local server:
+
+```env
+TELEGRAM_LOCAL_MODE=true
+TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
+TELEGRAM_API_FILE_URL=http://127.0.0.1:8081
+```
+
+One-command startup (`python bot.py`) with auto-launched local Bot API:
+
+```env
+TELEGRAM_LOCAL_MODE=true
+TELEGRAM_AUTO_START_LOCAL_API=true
+TELEGRAM_BOT_API_BIN=C:\path\to\telegram-bot-api.exe
+TELEGRAM_API_ID=123456
+TELEGRAM_API_HASH=your_api_hash
+TELEGRAM_LOCAL_API_HOST=127.0.0.1
+TELEGRAM_LOCAL_API_PORT=8081
+TELEGRAM_LOCAL_API_DATA_DIR=.telegram-bot-api-data
+TELEGRAM_LOCAL_DOCKER_DATA_DIR=C:\Users\Gena\Documents\Playground\tg-bot-api-data
+TELEGRAM_CONNECT_TIMEOUT=20
+TELEGRAM_READ_TIMEOUT=120
+TELEGRAM_WRITE_TIMEOUT=120
+TELEGRAM_MEDIA_WRITE_TIMEOUT=180
+TELEGRAM_POOL_TIMEOUT=15
+TELEGRAM_GET_UPDATES_READ_TIMEOUT=30
+TELEGRAM_LOCAL_DIRECT_PICKUP_MB=40
+TELEGRAM_LOCAL_PICKUP_WAIT_SECONDS=30
+```
+
+Important:
+- Before switching from cloud API to local API, call `logOut` once (per official docs).
+
+Dialogue mode notes:
+- Bot now auto-detects speaker count (heuristic local clustering).
+- If one speaker is detected, output is plain text (no `UserX:` labels).
+- If multiple speakers are detected, output is dialogue style (`User1`, `User2`, ...).
+- It is heuristic, so labels can be imperfect for noisy/overlapping speech.
+- When backend is `nemo` or `auto` and NeMo is installed, bot uses NeMo diarization first and falls back to heuristic if NeMo is unavailable.
+- On Windows, bot prefers NeMo `ClusteringDiarizer` (more stable) and only uses `NeuralDiarizer` as secondary fallback.
 
 ## Troubleshooting
 
@@ -167,6 +289,13 @@ They are cached locally, so re-download is not needed every start (unless cache 
 - Install cuDNN 9.x for CUDA 12
 - Ensure cuDNN DLL location is in `PATH` (or copied into CUDA `bin`)
 
+`BadRequest: File is too big`
+- Telegram cloud Bot API can reject large file downloads (commonly over 20 MB)
+- Bot now shows a friendly message instead of crashing
+- Send smaller file, or split audio before sending to the bot
+- You can configure the check via `.env`:
+  `TELEGRAM_DOWNLOAD_LIMIT_MB=20`
+
 Bot starts but transcriptions are inaccurate
 - Use `WHISPER_MODEL_SIZE=large-v3`
 - Use menu quality `best`
@@ -177,6 +306,16 @@ Very slow transcription
 - Enable CUDA (`WHISPER_DEVICE=cuda`, `WHISPER_COMPUTE_TYPE=float16`)
 - Use menu quality `balanced` or `fast`
 - Reduce model size (`medium`, `small`) if needed
+
+`NeMo available: no` in `/gpu`
+- Install NeMo requirements from `requirements-nemo.txt`
+- Prefer Python 3.11/3.12 for NeMo environment
+- Keep backend as `auto` if you want automatic fallback when NeMo is unavailable
+
+`[WinError 4551] ... blocked this file` during NeMo diarization
+- This is Windows Smart App Control / WDAC policy blocking external codec tools (commonly `ffprobe.exe`)
+- Current bot build pre-converts audio to local PCM WAV before NeMo diarization to reduce this dependency
+- If policy still blocks execution paths on your machine, use `/diar heuristic` as fallback
 
 ## Security Note
 

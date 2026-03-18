@@ -1,13 +1,26 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import atexit
 import asyncio
+import io
+import json
 import logging
 import os
 from pathlib import Path
+import shlex
+import shutil
+import socket
+import subprocess
+import threading
 from tempfile import TemporaryDirectory
+import time
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram.error import BadRequest, InvalidToken, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -24,11 +37,21 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# Prevent token exposure in verbose HTTP request logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 SUPPORTED_LANGUAGES = {"auto", "ru", "en"}
 SUPPORTED_QUALITIES = {"fast", "balanced", "best"}
+SUPPORTED_FORMATS = {"text", "dialog"}
+SUPPORTED_DIARIZATION = {"auto", "nemo", "heuristic"}
+SUPPORTED_SPEAKERS = {0, 2, 3, 4}
+
 user_language: dict[int, str] = {}
 user_quality: dict[int, str] = {}
+user_format: dict[int, str] = {}
+user_speakers: dict[int, int] = {}
+local_bot_api_process: subprocess.Popen | None = None
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -36,6 +59,37 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
+def _read_env_value_from_file(name: str, env_file: Path) -> str:
+    if not env_file.exists():
+        return ""
+    prefix = f"{name}="
+    try:
+        lines = env_file.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return ""
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if not line.startswith(prefix):
+            continue
+        value = line[len(prefix) :].strip().strip('"').strip("'")
+        return value
+    return ""
 
 
 def _get_user_language(user_id: int) -> str:
@@ -46,11 +100,43 @@ def _get_user_quality(user_id: int) -> str:
     return user_quality.get(user_id, "balanced")
 
 
+def _get_user_format(user_id: int) -> str:
+    return user_format.get(user_id, "dialog")
+
+
+def _default_speakers(transcriber: SpeechTranscriber | None) -> int:
+    if transcriber is not None and transcriber.nemo_num_speakers in SUPPORTED_SPEAKERS:
+        return transcriber.nemo_num_speakers
+    try:
+        env_value = int(os.getenv("NEMO_NUM_SPEAKERS", "0"))
+    except ValueError:
+        env_value = 0
+    return env_value if env_value in SUPPORTED_SPEAKERS else 0
+
+
+def _get_user_speakers(user_id: int, transcriber: SpeechTranscriber | None = None) -> int:
+    if user_id in user_speakers:
+        value = user_speakers[user_id]
+        if value in SUPPORTED_SPEAKERS:
+            return value
+    return _default_speakers(transcriber)
+
+
 def _find_dll_on_path(dll_name: str) -> str | None:
     for path_item in os.environ.get("PATH", "").split(os.pathsep):
         if not path_item:
             continue
         candidate = Path(path_item) / dll_name
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _find_executable_on_path(executable_name: str) -> str | None:
+    for path_item in os.environ.get("PATH", "").split(os.pathsep):
+        if not path_item:
+            continue
+        candidate = Path(path_item) / executable_name
         if candidate.exists():
             return str(candidate)
     return None
@@ -73,31 +159,75 @@ def _prepend_paths(paths: list[str]) -> None:
 def _configure_cuda_paths() -> None:
     env_extra = os.getenv("CUDA_EXTRA_PATHS", "").strip()
     user_paths = [p.strip() for p in env_extra.split(";") if p.strip()] if env_extra else []
-
-    auto_paths: list[str] = [
+    auto_paths = [
         r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin",
         r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin\x64",
         r"C:\Program Files\NVIDIA\CUDNN\v9.20\bin\12.9\x64",
     ]
-
     _prepend_paths(user_paths + auto_paths)
 
 
-def _settings_text(user_id: int) -> str:
-    lang = _get_user_language(user_id)
-    quality = _get_user_quality(user_id)
+def _configure_ffmpeg_paths() -> None:
+    env_extra = os.getenv("FFMPEG_EXTRA_PATHS", "").strip()
+    user_paths = [p.strip() for p in env_extra.split(";") if p.strip()] if env_extra else []
+    auto_paths = [
+        r"C:\ffmpeg\bin",
+        r"C:\Program Files\ffmpeg\bin",
+        r"C:\Program Files (x86)\ffmpeg\bin",
+    ]
+
+    winget_root = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
+    if winget_root.exists():
+        for pkg_dir in winget_root.glob("Gyan.FFmpeg_*"):
+            auto_paths.append(str(pkg_dir / "bin"))
+            for nested_bin in pkg_dir.glob("*\\bin"):
+                auto_paths.append(str(nested_bin))
+
+    _prepend_paths(user_paths + auto_paths)
+
+    ffmpeg = _find_executable_on_path("ffmpeg.exe")
+    ffprobe = _find_executable_on_path("ffprobe.exe")
+    if ffmpeg:
+        os.environ.setdefault("FFMPEG_BINARY", ffmpeg)
+        os.environ.setdefault("IMAGEIO_FFMPEG_EXE", ffmpeg)
+        logger.info("FFmpeg detected: %s", ffmpeg)
+    else:
+        logger.warning("ffmpeg.exe not found in PATH. NeMo/pydub audio conversion may fail.")
+    if ffprobe:
+        logger.info("FFprobe detected: %s", ffprobe)
+
+
+def _current_diarization_backend(transcriber: SpeechTranscriber | None) -> str:
+    if transcriber is None:
+        return os.getenv("DIARIZATION_BACKEND", "auto").strip().lower() or "auto"
+    return transcriber.diarization_backend
+
+
+def _settings_text(user_id: int, transcriber: SpeechTranscriber | None = None) -> str:
+    diarization_backend = _current_diarization_backend(transcriber)
+    speakers = _get_user_speakers(user_id, transcriber)
+    speakers_label = "auto" if speakers == 0 else str(speakers)
     return (
         "Settings menu:\n"
-        f"Language: {lang}\n"
-        f"Quality: {quality}\n\n"
+        f"Language: {_get_user_language(user_id)}\n"
+        f"Quality: {_get_user_quality(user_id)}\n"
+        f"Format: {_get_user_format(user_id)}\n"
+        f"Diarization: {diarization_backend}\n"
+        f"Speakers: {speakers_label}\n\n"
         "RU: Отправьте MP3/аудио/voice, и я сделаю транскрипт.\n"
         "EN: Send MP3/audio/voice and I will transcribe it."
     )
 
 
-def _settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
+def _settings_keyboard(
+    user_id: int,
+    transcriber: SpeechTranscriber | None = None,
+) -> InlineKeyboardMarkup:
     lang = _get_user_language(user_id)
     quality = _get_user_quality(user_id)
+    out_format = _get_user_format(user_id)
+    diarization_backend = _current_diarization_backend(transcriber)
+    speaker_mode = _get_user_speakers(user_id, transcriber)
 
     def mark(active: bool, label: str) -> str:
         return f"[x] {label}" if active else f"[ ] {label}"
@@ -118,6 +248,21 @@ def _settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(mark(quality == "best", "Best"), callback_data="quality:best"),
             ],
             [
+                InlineKeyboardButton(mark(out_format == "text", "Text"), callback_data="format:text"),
+                InlineKeyboardButton(mark(out_format == "dialog", "Dialog"), callback_data="format:dialog"),
+            ],
+            [
+                InlineKeyboardButton(mark(diarization_backend == "auto", "Diar Auto"), callback_data="diar:auto"),
+                InlineKeyboardButton(mark(diarization_backend == "nemo", "Diar NeMo"), callback_data="diar:nemo"),
+                InlineKeyboardButton(mark(diarization_backend == "heuristic", "Diar Heuristic"), callback_data="diar:heuristic"),
+            ],
+            [
+                InlineKeyboardButton(mark(speaker_mode == 0, "Spk Auto"), callback_data="spk:auto"),
+                InlineKeyboardButton(mark(speaker_mode == 2, "Spk 2"), callback_data="spk:2"),
+                InlineKeyboardButton(mark(speaker_mode == 3, "Spk 3"), callback_data="spk:3"),
+                InlineKeyboardButton(mark(speaker_mode == 4, "Spk 4"), callback_data="spk:4"),
+            ],
+            [
                 InlineKeyboardButton("Show current", callback_data="settings:show"),
                 InlineKeyboardButton("Close menu", callback_data="settings:close"),
             ],
@@ -125,11 +270,78 @@ def _settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
-async def _send_menu(message, user_id: int) -> None:
+async def _send_menu(
+    message,
+    user_id: int,
+    transcriber: SpeechTranscriber | None = None,
+) -> None:
     await message.reply_text(
-        _settings_text(user_id),
-        reply_markup=_settings_keyboard(user_id),
+        _settings_text(user_id, transcriber),
+        reply_markup=_settings_keyboard(user_id, transcriber),
     )
+
+
+async def _safe_edit_settings_menu(
+    query,
+    user_id: int,
+    transcriber: SpeechTranscriber | None,
+) -> None:
+    await _safe_query_edit_message_text(
+        query,
+        _settings_text(user_id, transcriber),
+        reply_markup=_settings_keyboard(user_id, transcriber),
+    )
+
+
+async def _safe_query_answer(
+    query,
+    text: str | None = None,
+    *,
+    show_alert: bool = False,
+    retries: int = 2,
+) -> bool:
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            await query.answer(text, show_alert=show_alert)
+            return True
+        except BadRequest as exc:
+            msg = str(exc).lower()
+            # Callback may already be answered/expired; not fatal.
+            if "query is too old" in msg or "query id is invalid" in msg:
+                return False
+            raise
+        except (TimedOut, NetworkError) as exc:
+            if attempt >= retries:
+                logger.warning("query.answer failed after retries: %s", exc)
+                return False
+            await asyncio.sleep(0.35 * attempt)
+    return False
+
+
+async def _safe_query_edit_message_text(
+    query,
+    text: str,
+    *,
+    reply_markup=None,
+    retries: int = 2,
+) -> bool:
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+            return True
+        except BadRequest as exc:
+            msg = str(exc).lower()
+            if "message is not modified" in msg:
+                return False
+            if "message to edit not found" in msg:
+                return False
+            raise
+        except (TimedOut, NetworkError) as exc:
+            if attempt >= retries:
+                logger.warning("query.edit_message_text failed after retries: %s", exc)
+                return False
+            await asyncio.sleep(0.35 * attempt)
+    return False
 
 
 def _extract_file_info(update: Update) -> tuple[str, str]:
@@ -147,6 +359,403 @@ def _extract_file_info(update: Update) -> tuple[str, str]:
         return message.document.file_id, ext
 
     raise ValueError("No supported audio payload found.")
+
+
+def _extract_file_size(update: Update) -> int:
+    message = update.effective_message
+    if message is None:
+        return 0
+    if message.audio and message.audio.file_size:
+        return int(message.audio.file_size)
+    if message.voice and message.voice.file_size:
+        return int(message.voice.file_size)
+    if message.document and message.document.file_size:
+        return int(message.document.file_size)
+    return 0
+
+
+def _telegram_download_limit_bytes() -> int:
+    raw = os.getenv("TELEGRAM_DOWNLOAD_LIMIT_MB", "20").strip()
+    try:
+        mb = int(raw)
+    except ValueError:
+        mb = 20
+    mb = max(1, mb)
+    return mb * 1024 * 1024
+
+
+def _size_to_mb_text(size_bytes: int) -> str:
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _local_api_host() -> str:
+    return os.getenv("TELEGRAM_LOCAL_API_HOST", "127.0.0.1").strip() or "127.0.0.1"
+
+
+def _local_api_port() -> int:
+    raw = os.getenv("TELEGRAM_LOCAL_API_PORT", "8081").strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        port = 8081
+    return min(max(port, 1), 65535)
+
+
+def _local_api_base_url() -> str:
+    return f"http://{_local_api_host()}:{_local_api_port()}"
+
+
+def _is_local_api_reachable(timeout_sec: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((_local_api_host(), _local_api_port()), timeout=timeout_sec):
+            return True
+    except OSError:
+        return False
+
+
+def _stop_local_bot_api_process() -> None:
+    global local_bot_api_process
+    process = local_bot_api_process
+    if process is None:
+        return
+    if process.poll() is not None:
+        local_bot_api_process = None
+        return
+    logger.info("Stopping local Telegram Bot API server (pid=%s)...", process.pid)
+    process.terminate()
+    try:
+        process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        process.kill()
+    local_bot_api_process = None
+
+
+def _start_local_bot_api_if_needed() -> None:
+    global local_bot_api_process
+    if not _env_bool("TELEGRAM_LOCAL_MODE", False):
+        return
+
+    if _is_local_api_reachable():
+        logger.info(
+            "Using already running local Telegram Bot API at %s.",
+            _local_api_base_url(),
+        )
+        return
+
+    if not _env_bool("TELEGRAM_AUTO_START_LOCAL_API", False):
+        raise RuntimeError(
+            "TELEGRAM_LOCAL_MODE=true but local Telegram Bot API server is not reachable. "
+            "Start it manually or set TELEGRAM_AUTO_START_LOCAL_API=true."
+        )
+
+    bot_api_bin = os.getenv("TELEGRAM_BOT_API_BIN", "").strip()
+    if not bot_api_bin:
+        raise RuntimeError("Set TELEGRAM_BOT_API_BIN to auto-start local Telegram Bot API server.")
+    api_id = os.getenv("TELEGRAM_API_ID", "").strip()
+    api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
+    if not api_id or not api_hash:
+        raise RuntimeError("Set TELEGRAM_API_ID and TELEGRAM_API_HASH for local Telegram Bot API server.")
+
+    data_dir_raw = os.getenv("TELEGRAM_LOCAL_API_DATA_DIR", ".telegram-bot-api-data").strip()
+    data_dir = Path(data_dir_raw)
+    if not data_dir.is_absolute():
+        data_dir = Path.cwd() / data_dir
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        bot_api_bin,
+        "--local",
+        f"--api-id={api_id}",
+        f"--api-hash={api_hash}",
+        f"--http-port={_local_api_port()}",
+        f"--dir={data_dir}",
+    ]
+    extra_args = os.getenv("TELEGRAM_BOT_API_EXTRA_ARGS", "").strip()
+    if extra_args:
+        cmd.extend(shlex.split(extra_args, posix=os.name != "nt"))
+
+    logger.info("Starting local Telegram Bot API server...")
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+    )
+    local_bot_api_process = process
+
+    deadline = time.monotonic() + 25.0
+    while time.monotonic() < deadline:
+        if _is_local_api_reachable(timeout_sec=0.8):
+            logger.info(
+                "Local Telegram Bot API is ready at %s (pid=%s).",
+                _local_api_base_url(),
+                process.pid,
+            )
+            return
+        if process.poll() is not None:
+            break
+        time.sleep(0.4)
+
+    _stop_local_bot_api_process()
+    raise RuntimeError(
+        "Failed to start local Telegram Bot API server automatically. "
+        "Check TELEGRAM_BOT_API_BIN, TELEGRAM_API_ID, TELEGRAM_API_HASH."
+    )
+
+
+def _normalize_bot_base_url(base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/bot"):
+        return normalized
+    return f"{normalized}/bot"
+
+
+def _normalize_file_base_url(file_base_url: str) -> str:
+    normalized = file_base_url.rstrip("/")
+    if normalized.endswith("/file/bot"):
+        return normalized
+    if normalized.endswith("/file"):
+        return f"{normalized}/bot"
+    return f"{normalized}/file/bot"
+
+
+def _prefer_loopback_ipv4(url: str) -> str:
+    parsed = urllib_parse.urlsplit(url)
+    hostname = parsed.hostname or ""
+    if hostname.lower() != "localhost":
+        return url
+    port = f":{parsed.port}" if parsed.port else ""
+    userinfo = ""
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo += f":{parsed.password}"
+        userinfo += "@"
+    netloc = f"{userinfo}127.0.0.1{port}"
+    return urllib_parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _check_local_bot_api_get_me(
+    token: str,
+    bot_base_url: str,
+    retries: int = 6,
+    delay_seconds: float = 0.6,
+) -> tuple[bool, str]:
+    if not token:
+        return False, "missing TELEGRAM_BOT_TOKEN"
+    base = _normalize_bot_base_url(bot_base_url)
+    get_me_url = f"{base}{token}/getMe"
+    last_reason = "unknown error"
+    for _ in range(max(1, retries)):
+        try:
+            with urllib_request.urlopen(get_me_url, timeout=4) as response:
+                if response.status != 200:
+                    last_reason = f"http {response.status}"
+                    time.sleep(delay_seconds)
+                    continue
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+                if bool(payload.get("ok")):
+                    return True, "ok"
+                last_reason = "response ok=false"
+        except (urllib_error.HTTPError, urllib_error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            last_reason = f"{exc.__class__.__name__}: {exc}"
+        time.sleep(delay_seconds)
+    return False, last_reason
+
+
+def _local_bot_api_data_roots() -> list[Path]:
+    roots: list[Path] = []
+    explicit_docker_root = os.getenv("TELEGRAM_LOCAL_DOCKER_DATA_DIR", "").strip()
+    if explicit_docker_root:
+        roots.append(Path(explicit_docker_root))
+
+    local_data_dir = os.getenv("TELEGRAM_LOCAL_API_DATA_DIR", "").strip()
+    if local_data_dir:
+        local_data_path = Path(local_data_dir)
+        if not local_data_path.is_absolute():
+            local_data_path = Path.cwd() / local_data_path
+        roots.append(local_data_path)
+
+    roots.append(Path.cwd() / "tg-bot-api-data")
+    roots.append(Path.cwd().parent / "tg-bot-api-data")
+
+    deduped_roots: list[Path] = []
+    seen_roots: set[str] = set()
+    for root in roots:
+        key = str(root).lower()
+        if key in seen_roots:
+            continue
+        seen_roots.add(key)
+        deduped_roots.append(root)
+    return deduped_roots
+
+
+async def _get_file_with_retries(
+    bot,
+    file_id: str,
+    retries: int = 4,
+    base_delay_seconds: float = 0.9,
+):
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            return await bot.get_file(file_id)
+        except (TimedOut, NetworkError) as exc:
+            last_exc = exc
+            if attempt >= retries:
+                break
+            sleep_for = base_delay_seconds * attempt
+            logger.warning(
+                "get_file timeout/network error (attempt %s/%s): %s; retrying in %.1fs",
+                attempt,
+                retries,
+                exc,
+                sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("get_file failed unexpectedly without exception")
+
+
+def _resolve_local_bot_api_file_path(file_path: str | None) -> Path | None:
+    if not file_path:
+        return None
+    raw = file_path.strip()
+    if not raw:
+        return None
+
+    direct = Path(raw)
+    if direct.exists() and direct.is_file():
+        return direct
+
+    docker_root_prefix = "/var/lib/telegram-bot-api/"
+    colon_replacement = "\uf03a"
+
+    deduped_roots = _local_bot_api_data_roots()
+
+    relative_options: list[Path] = []
+    normalized = raw.replace("\\", "/")
+    if normalized.startswith(docker_root_prefix):
+        rel = normalized[len(docker_root_prefix) :]
+        if rel:
+            parts = [part for part in rel.split("/") if part]
+            relative_options.append(Path(*parts))
+            translated = [part.replace(":", colon_replacement) for part in parts]
+            if translated != parts:
+                relative_options.append(Path(*translated))
+    else:
+        parts = [part for part in normalized.split("/") if part]
+        if parts:
+            relative_options.append(Path(*parts))
+            translated = [part.replace(":", colon_replacement) for part in parts]
+            if translated != parts:
+                relative_options.append(Path(*translated))
+
+    # Try direct relative match under root and under token directories.
+    for root in deduped_roots:
+        if not root.exists():
+            continue
+        for rel_path in relative_options:
+            candidate = root / rel_path
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        try:
+            token_dirs = [entry for entry in root.iterdir() if entry.is_dir()]
+        except OSError:
+            token_dirs = []
+        for token_dir in token_dirs:
+            for rel_path in relative_options:
+                candidate = token_dir / rel_path
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+
+    # Fallback: search by basename and pick the freshest match.
+    basename = Path(normalized).name
+    if basename:
+        basename_lower = basename.lower()
+        newest_match: Path | None = None
+        newest_mtime: float = -1.0
+        for root in deduped_roots:
+            if not root.exists():
+                continue
+            try:
+                for candidate in root.rglob("*"):
+                    if not candidate.is_file():
+                        continue
+                    if candidate.name.lower() != basename_lower:
+                        continue
+                    try:
+                        mtime = candidate.stat().st_mtime
+                    except OSError:
+                        mtime = -1.0
+                    if mtime > newest_mtime:
+                        newest_mtime = mtime
+                        newest_match = candidate
+            except OSError:
+                continue
+        if newest_match is not None:
+            return newest_match
+
+    return None
+
+
+def _resolve_recent_local_media_file(file_ext: str, expected_size: int = 0) -> Path | None:
+    ext = (file_ext or "").lower()
+    newest_match: Path | None = None
+    newest_mtime: float = -1.0
+    for root in _local_bot_api_data_roots():
+        if not root.exists():
+            continue
+        try:
+            for candidate in root.rglob("*"):
+                if not candidate.is_file():
+                    continue
+                if ext and candidate.suffix.lower() != ext:
+                    continue
+                try:
+                    stat = candidate.stat()
+                except OSError:
+                    continue
+                if expected_size > 0 and stat.st_size != expected_size:
+                    continue
+                if stat.st_mtime > newest_mtime:
+                    newest_mtime = stat.st_mtime
+                    newest_match = candidate
+        except OSError:
+            continue
+    return newest_match
+
+
+def _local_direct_pickup_threshold_bytes() -> int:
+    raw = os.getenv("TELEGRAM_LOCAL_DIRECT_PICKUP_MB", "40").strip()
+    try:
+        mb = int(raw)
+    except ValueError:
+        mb = 40
+    mb = max(1, mb)
+    return mb * 1024 * 1024
+
+
+def _local_direct_pickup_wait_seconds() -> float:
+    return max(1.0, _env_float("TELEGRAM_LOCAL_PICKUP_WAIT_SECONDS", 30.0))
+
+
+async def _wait_for_recent_local_media_file(
+    file_ext: str,
+    expected_size: int,
+    timeout_seconds: float,
+) -> Path | None:
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    while time.monotonic() < deadline:
+        candidate = _resolve_recent_local_media_file(file_ext, expected_size=expected_size)
+        if candidate is not None:
+            return candidate
+        await asyncio.sleep(0.7)
+    return None
 
 
 def _split_for_telegram(text: str, max_chars: int = 3900) -> list[str]:
@@ -172,13 +781,77 @@ def _split_for_telegram(text: str, max_chars: int = 3900) -> list[str]:
     return chunks
 
 
+def _render_progress_bar(done: int, total: int, width: int = 18) -> str:
+    if total <= 0:
+        return "[------------------] 0%"
+    clamped_done = max(0, min(done, total))
+    ratio = clamped_done / total
+    filled = int(ratio * width)
+    return f"[{'#' * filled}{'-' * (width - filled)}] {int(ratio * 100):d}%"
+
+
+def _build_progress_text(state: dict[str, object], elapsed_seconds: float) -> str:
+    stage = str(state.get("stage", "transcribing"))
+    msg = str(state.get("message", "Processing audio..."))
+    done_chunks = int(state.get("done_chunks", 0) or 0)
+    total_chunks = int(state.get("total_chunks", 0) or 0)
+
+    lines = [msg]
+    if total_chunks > 0:
+        lines.append(f"{_render_progress_bar(done_chunks, total_chunks)}  ({done_chunks}/{total_chunks} chunks)")
+    minutes = int(elapsed_seconds // 60)
+    seconds = int(elapsed_seconds % 60)
+    lines.append(f"Elapsed: {minutes:02d}:{seconds:02d}")
+    if stage == "model_loading":
+        lines.append("Stage: loading model")
+    elif stage == "diarization":
+        lines.append("Stage: speaker diarization")
+    elif stage == "finalizing":
+        lines.append("Stage: finalizing")
+    else:
+        lines.append("Stage: transcription")
+    return "\n".join(lines)
+
+
+async def _progress_message_updater(
+    progress_message,
+    state: dict[str, object],
+    state_lock: threading.Lock,
+    stop_event: asyncio.Event,
+) -> None:
+    started = time.monotonic()
+    last_text = ""
+    while not stop_event.is_set():
+        await asyncio.sleep(4)
+        with state_lock:
+            snapshot = dict(state)
+        text = _build_progress_text(snapshot, time.monotonic() - started)
+        if text == last_text:
+            continue
+        try:
+            await progress_message.edit_text(text)
+            last_text = text
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                continue
+            logger.debug("Progress edit ignored: %s", exc)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("Progress updater failed: %s", exc)
+
+
 def _format_gpu_status(transcriber: SpeechTranscriber) -> str:
     status = transcriber.status()
-    model_loaded = "yes" if status["model_loaded"] else "no"
-    loading = "yes" if status["loading"] else "no"
-    state = "CUDA active" if status["active_device"] == "cuda" else "CPU mode active"
     cublas = _find_dll_on_path("cublas64_12.dll") or "not found"
     cudnn = _find_dll_on_path("cudnn64_9.dll") or "not found"
+    ffmpeg = _find_executable_on_path("ffmpeg.exe") or "not found"
+    ffprobe = _find_executable_on_path("ffprobe.exe") or "not found"
+    nemo_available = status.get("nemo_available")
+    if nemo_available is None:
+        nemo_line = "NeMo available: n/a (backend disabled)"
+    else:
+        nemo_line = f"NeMo available: {'yes' if nemo_available else 'no'}"
+        if not nemo_available and status.get("nemo_reason"):
+            nemo_line = f"{nemo_line}\nNeMo note: {status['nemo_reason']}"
     return (
         "Runtime status:\n"
         f"Model: {status['model_size']}\n"
@@ -186,66 +859,72 @@ def _format_gpu_status(transcriber: SpeechTranscriber) -> str:
         f"Active device: {status['active_device']}\n"
         f"Requested compute: {status['requested_compute_type']}\n"
         f"Active compute: {status['active_compute_type']}\n"
-        f"Model loaded: {model_loaded}\n"
-        f"Loading now: {loading}\n"
+        f"Diarization backend: {status['diarization_backend']}\n"
+        f"Default NeMo speakers: {status['nemo_num_speakers']}\n"
+        f"Model loaded: {'yes' if status['model_loaded'] else 'no'}\n"
+        f"Loading now: {'yes' if status['loading'] else 'no'}\n"
+        f"{nemo_line}\n"
         f"cublas64_12.dll: {cublas}\n"
         f"cudnn64_9.dll: {cudnn}\n"
-        f"State: {state}\n\n"
-        "If active device is cpu while requested is cuda, CPU fallback is active."
+        f"ffmpeg.exe: {ffmpeg}\n"
+        f"ffprobe.exe: {ffprobe}"
     )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
     user = update.effective_user
     if message is None or user is None:
         return
-
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
     await message.reply_text(
         "Send me an MP3/audio file and I will convert speech to text.\n"
         "Use /help for interactive settings menu.\n"
         "Use /gpu to check CUDA/CPU runtime status.\n"
-        "First transcription may take several minutes while model downloads/loads."
+        "Use /diar auto|nemo|heuristic to choose diarization backend.\n"
+        "Use /speakers auto|2|3|4 to guide speaker count.\n"
+        "Default output format is dialog (User1/User2)."
     )
-    await _send_menu(message, user.id)
+    await _send_menu(message, user.id, transcriber)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
     user = update.effective_user
     if message is None or user is None:
         return
-
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
     await message.reply_text(
         "Commands:\n"
         "/help - open settings menu\n"
         "/settings - open settings menu\n"
         "/lang auto|ru|en\n"
         "/quality fast|balanced|best\n"
+        "/format text|dialog\n"
+        "/diar auto|nemo|heuristic\n"
+        "/speakers auto|2|3|4\n"
         "/gpu - show runtime device status\n\n"
         "Send audio as voice, audio, or file attachment."
     )
-    await _send_menu(message, user.id)
+    await _send_menu(message, user.id, transcriber)
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
     user = update.effective_user
     if message is None or user is None:
         return
-    await _send_menu(message, user.id)
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
+    await _send_menu(message, user.id, transcriber)
 
 
 async def text_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
     user = update.effective_user
     if message is None or user is None:
         return
 
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
     await message.reply_text(
         "RU:\n"
         "Я распознаю речь из аудио файлов.\n"
@@ -253,10 +932,9 @@ async def text_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "EN:\n"
         "I transcribe speech from audio files.\n"
         "Please send an MP3/audio/voice message.\n\n"
-        "Use /help for settings.\n"
-        "Use /gpu to check runtime device."
+        "Use /help for settings."
     )
-    await _send_menu(message, user.id)
+    await _send_menu(message, user.id, transcriber)
 
 
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -264,20 +942,17 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user = update.effective_user
     if message is None or user is None:
         return
-
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
     if not context.args:
-        current = _get_user_language(user.id)
-        await message.reply_text(f"Current language mode: {current}")
+        await message.reply_text(f"Current language mode: {_get_user_language(user.id)}")
         return
-
     chosen = context.args[0].strip().lower()
     if chosen not in SUPPORTED_LANGUAGES:
         await message.reply_text("Use: /lang auto | /lang ru | /lang en")
         return
-
     user_language[user.id] = chosen
     await message.reply_text(f"Language mode set to: {chosen}")
-    await _send_menu(message, user.id)
+    await _send_menu(message, user.id, transcriber)
 
 
 async def set_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -285,85 +960,195 @@ async def set_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     if message is None or user is None:
         return
-
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
     if not context.args:
-        current = _get_user_quality(user.id)
-        await message.reply_text(f"Current quality mode: {current}")
+        await message.reply_text(f"Current quality mode: {_get_user_quality(user.id)}")
         return
-
     chosen = context.args[0].strip().lower()
     if chosen not in SUPPORTED_QUALITIES:
         await message.reply_text("Use: /quality fast | /quality balanced | /quality best")
         return
-
     user_quality[user.id] = chosen
     await message.reply_text(f"Quality mode set to: {chosen}")
-    await _send_menu(message, user.id)
+    await _send_menu(message, user.id, transcriber)
+
+
+async def set_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
+    if not context.args:
+        await message.reply_text(f"Current output format: {_get_user_format(user.id)}")
+        return
+    chosen = context.args[0].strip().lower()
+    if chosen not in SUPPORTED_FORMATS:
+        await message.reply_text("Use: /format text | /format dialog")
+        return
+    user_format[user.id] = chosen
+    await message.reply_text(f"Output format set to: {chosen}")
+    await _send_menu(message, user.id, transcriber)
+
+
+async def set_diarization_backend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
+    if transcriber is None:
+        await message.reply_text("Transcriber is not initialized yet.")
+        return
+
+    if not context.args:
+        await message.reply_text(f"Current diarization backend: {transcriber.diarization_backend}")
+        await _send_menu(message, user.id, transcriber)
+        return
+
+    chosen = context.args[0].strip().lower()
+    if chosen not in SUPPORTED_DIARIZATION:
+        await message.reply_text("Use: /diar auto | /diar nemo | /diar heuristic")
+        return
+
+    try:
+        transcriber.set_diarization_backend(chosen)
+    except ValueError:
+        await message.reply_text("Unsupported diarization backend.")
+        return
+
+    await message.reply_text(f"Diarization backend set to: {chosen}")
+    await _send_menu(message, user.id, transcriber)
+
+
+async def set_speakers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
+    current = _get_user_speakers(user.id, transcriber)
+    if not context.args:
+        current_label = "auto" if current == 0 else str(current)
+        await message.reply_text(f"Current speaker mode: {current_label}")
+        await _send_menu(message, user.id, transcriber)
+        return
+
+    raw = context.args[0].strip().lower()
+    if raw == "auto":
+        chosen = 0
+    else:
+        try:
+            chosen = int(raw)
+        except ValueError:
+            chosen = -1
+
+    if chosen not in SUPPORTED_SPEAKERS:
+        await message.reply_text("Use: /speakers auto | /speakers 2 | /speakers 3 | /speakers 4")
+        return
+
+    user_speakers[user.id] = chosen
+    chosen_label = "auto" if chosen == 0 else str(chosen)
+    await message.reply_text(f"Speaker mode set to: {chosen_label}")
+    await _send_menu(message, user.id, transcriber)
 
 
 async def gpu_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
         return
-
     transcriber: SpeechTranscriber = context.application.bot_data.get("transcriber")
     if transcriber is None:
         await message.reply_text("Transcriber is not initialized yet.")
         return
-
     await message.reply_text(_format_gpu_status(transcriber))
 
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     query = update.callback_query
     user = update.effective_user
     if query is None or user is None:
         return
 
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
     data = query.data or ""
     if data.startswith("lang:"):
         chosen = data.split(":", 1)[1]
         if chosen in SUPPORTED_LANGUAGES:
             user_language[user.id] = chosen
-            await query.answer(f"Language: {chosen}")
+            await _safe_query_answer(query, f"Language: {chosen}")
         else:
-            await query.answer("Unsupported language", show_alert=True)
-        await query.edit_message_text(
-            _settings_text(user.id),
-            reply_markup=_settings_keyboard(user.id),
-        )
+            await _safe_query_answer(query, "Unsupported language", show_alert=True)
+        await _safe_edit_settings_menu(query, user.id, transcriber)
         return
 
     if data.startswith("quality:"):
         chosen = data.split(":", 1)[1]
         if chosen in SUPPORTED_QUALITIES:
             user_quality[user.id] = chosen
-            await query.answer(f"Quality: {chosen}")
+            await _safe_query_answer(query, f"Quality: {chosen}")
         else:
-            await query.answer("Unsupported quality", show_alert=True)
-        await query.edit_message_text(
-            _settings_text(user.id),
-            reply_markup=_settings_keyboard(user.id),
-        )
+            await _safe_query_answer(query, "Unsupported quality", show_alert=True)
+        await _safe_edit_settings_menu(query, user.id, transcriber)
+        return
+
+    if data.startswith("format:"):
+        chosen = data.split(":", 1)[1]
+        if chosen in SUPPORTED_FORMATS:
+            user_format[user.id] = chosen
+            await _safe_query_answer(query, f"Format: {chosen}")
+        else:
+            await _safe_query_answer(query, "Unsupported format", show_alert=True)
+        await _safe_edit_settings_menu(query, user.id, transcriber)
+        return
+
+    if data.startswith("diar:"):
+        chosen = data.split(":", 1)[1]
+        if chosen not in SUPPORTED_DIARIZATION:
+            await _safe_query_answer(query, "Unsupported backend", show_alert=True)
+            return
+        if transcriber is None:
+            await _safe_query_answer(query, "Transcriber not ready", show_alert=True)
+            return
+        try:
+            transcriber.set_diarization_backend(chosen)
+        except ValueError:
+            await _safe_query_answer(query, "Unsupported backend", show_alert=True)
+            return
+        await _safe_query_answer(query, f"Diarization: {chosen}")
+        await _safe_edit_settings_menu(query, user.id, transcriber)
+        return
+
+    if data.startswith("spk:"):
+        raw = data.split(":", 1)[1].strip().lower()
+        if raw == "auto":
+            chosen = 0
+        else:
+            try:
+                chosen = int(raw)
+            except ValueError:
+                chosen = -1
+        if chosen not in SUPPORTED_SPEAKERS:
+            await _safe_query_answer(query, "Unsupported speaker mode", show_alert=True)
+            return
+        user_speakers[user.id] = chosen
+        chosen_label = "auto" if chosen == 0 else str(chosen)
+        await _safe_query_answer(query, f"Speakers: {chosen_label}")
+        await _safe_edit_settings_menu(query, user.id, transcriber)
         return
 
     if data == "settings:show":
-        await query.answer("Updated")
-        await query.edit_message_text(
-            _settings_text(user.id),
-            reply_markup=_settings_keyboard(user.id),
-        )
+        await _safe_query_answer(query, "Updated")
+        await _safe_edit_settings_menu(query, user.id, transcriber)
         return
 
     if data == "settings:close":
-        await query.answer("Closed")
-        await query.edit_message_text(
-            "Menu closed. Use /help or /settings to open it again."
-        )
+        await _safe_query_answer(query, "Closed")
+        await _safe_query_edit_message_text(query, "Menu closed. Use /help or /settings to open it again.")
         return
 
-    await query.answer("Unknown action")
+    await _safe_query_answer(query, "Unknown action")
 
 
 async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -375,41 +1160,222 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     transcriber: SpeechTranscriber = context.application.bot_data["transcriber"]
     language = _get_user_language(user.id)
     quality = _get_user_quality(user.id)
+    output_format = _get_user_format(user.id)
+    speaker_mode = _get_user_speakers(user.id, transcriber)
 
     progress = await message.reply_text("Downloading audio...")
+    state_lock = threading.Lock()
+    progress_state: dict[str, object] = {
+        "stage": "download",
+        "message": "Downloading audio...",
+        "done_chunks": 0,
+        "total_chunks": 0,
+    }
+    stop_event = asyncio.Event()
+    updater_task: asyncio.Task | None = None
     try:
+        bot_is_local_mode = bool(getattr(context.bot, "local_mode", False))
+        file_size = _extract_file_size(update)
+        limit_bytes = _telegram_download_limit_bytes()
+        if (not bot_is_local_mode) and file_size > 0 and file_size > limit_bytes:
+            await progress.edit_text(
+                "RU:\n"
+                f"Файл слишком большой для загрузки через Telegram Bot API "
+                f"({_size_to_mb_text(file_size)} > {_size_to_mb_text(limit_bytes)}).\n"
+                "Пожалуйста, отправьте более маленький файл (или предварительно разделите аудио).\n\n"
+                "EN:\n"
+                f"File is too large for Telegram Bot API download "
+                f"({_size_to_mb_text(file_size)} > {_size_to_mb_text(limit_bytes)}).\n"
+                "Please send a smaller file (or split audio first)."
+            )
+            return
+
         file_id, file_ext = _extract_file_info(update)
-        tg_file = await context.bot.get_file(file_id)
+        tg_file = None
+        direct_source: Path | None = None
+
+        # For big local files, prefer direct pickup from local Bot API storage.
+        if bot_is_local_mode and file_size > 0 and file_size >= _local_direct_pickup_threshold_bytes():
+            direct_source = await _wait_for_recent_local_media_file(
+                file_ext=file_ext,
+                expected_size=file_size,
+                timeout_seconds=_local_direct_pickup_wait_seconds(),
+            )
+            if direct_source is not None:
+                logger.info(
+                    "Using direct local storage source for large file: %s (%s)",
+                    direct_source,
+                    _size_to_mb_text(file_size),
+                )
+
+        if direct_source is None:
+            try:
+                tg_file = await _get_file_with_retries(context.bot, file_id)
+            except BadRequest as exc:
+                if "file is too big" in str(exc).lower():
+                    if bot_is_local_mode:
+                        await progress.edit_text(
+                            "RU:\n"
+                            "Локальный Bot API ответил: File is too big.\n"
+                            "Обычно это значит, что сервер запущен без local mode.\n"
+                            "Перезапустите контейнер с TELEGRAM_LOCAL=1 (или бинарник с --local).\n\n"
+                            "EN:\n"
+                            "Local Bot API returned: File is too big.\n"
+                            "Usually this means the server is running without local mode.\n"
+                            "Restart container with TELEGRAM_LOCAL=1 (or binary with --local)."
+                        )
+                    else:
+                        await progress.edit_text(
+                            "RU:\n"
+                            "Telegram вернул ошибку: файл слишком большой для скачивания ботом.\n"
+                            "Отправьте файл меньше лимита Bot API или разделите аудио перед отправкой.\n\n"
+                            "EN:\n"
+                            "Telegram returned: file is too big for bot download.\n"
+                            "Send a smaller file or split audio before upload."
+                        )
+                    return
+                raise
+            except (TimedOut, NetworkError) as exc:
+                if bot_is_local_mode:
+                    direct_source = await _wait_for_recent_local_media_file(
+                        file_ext=file_ext,
+                        expected_size=file_size,
+                        timeout_seconds=_local_direct_pickup_wait_seconds(),
+                    )
+                    if direct_source is not None:
+                        logger.warning(
+                            "get_file failed (%s), using local recent-file fallback: %s",
+                            exc,
+                            direct_source,
+                        )
+                    else:
+                        await progress.edit_text(
+                            "RU:\n"
+                            "Таймаут при обращении к Telegram Bot API (getFile), "
+                            "и файл не найден в локальном storage.\n"
+                            "Проверьте Docker volume и попробуйте ещё раз.\n\n"
+                            "EN:\n"
+                            "Timeout while calling Telegram Bot API (getFile), "
+                            "and file was not found in local storage fallback.\n"
+                            "Check Docker volume and try again."
+                        )
+                        return
+                else:
+                    await progress.edit_text(
+                        "RU:\n"
+                        "Таймаут при обращении к Telegram Bot API (getFile).\n"
+                        "Проверьте сервер и попробуйте ещё раз.\n\n"
+                        "EN:\n"
+                        "Timeout while calling Telegram Bot API (getFile).\n"
+                        "Check server and try again."
+                    )
+                    return
 
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             input_path = tmp_path / f"input{file_ext}"
-            await tg_file.download_to_drive(custom_path=str(input_path))
-
-            if not transcriber.is_model_loaded():
-                await progress.edit_text(
-                    "Preparing model for first run (download + load). "
-                    "Please wait, this can take a few minutes..."
-                )
+            if direct_source is not None:
+                await progress.edit_text("Copying audio from local Bot API storage...")
+                shutil.copyfile(direct_source, input_path)
+                logger.info("Copied input via local storage source: %s -> %s", direct_source, input_path)
+            elif tg_file is not None:
+                try:
+                    await tg_file.download_to_drive(custom_path=str(input_path))
+                except (InvalidToken, BadRequest) as exc:
+                    message_lower = str(exc).lower()
+                    fallback_source = None
+                    if bot_is_local_mode and ("not found" in message_lower or "invalid token" in message_lower):
+                        fallback_source = _resolve_local_bot_api_file_path(tg_file.file_path)
+                        if fallback_source is None:
+                            fallback_source = await _wait_for_recent_local_media_file(
+                                file_ext=file_ext,
+                                expected_size=file_size,
+                                timeout_seconds=_local_direct_pickup_wait_seconds(),
+                            )
+                    if fallback_source is not None:
+                        shutil.copyfile(fallback_source, input_path)
+                        logger.info(
+                            "Downloaded file via local storage fallback: %s -> %s",
+                            fallback_source,
+                            input_path,
+                        )
+                    else:
+                        if bot_is_local_mode and ("not found" in message_lower or "invalid token" in message_lower):
+                            logger.warning(
+                                "Local file endpoint failed and storage fallback could not resolve path. file_path=%r",
+                                tg_file.file_path,
+                            )
+                            await progress.edit_text(
+                                "RU:\n"
+                                "Не удалось скачать файл через локальный file endpoint.\n"
+                                "Для Docker укажите путь к data volume в TELEGRAM_LOCAL_DOCKER_DATA_DIR.\n"
+                                "Пример: C:\\Users\\Gena\\Documents\\Playground\\tg-bot-api-data\n\n"
+                                "EN:\n"
+                                "Could not download file via local file endpoint.\n"
+                                "For Docker, set TELEGRAM_LOCAL_DOCKER_DATA_DIR to your host data volume path.\n"
+                                "Example: C:\\Users\\Gena\\Documents\\Playground\\tg-bot-api-data"
+                            )
+                            return
+                        raise
             else:
-                await progress.edit_text(
-                    f"Transcribing... (quality={quality}, language={language})"
+                raise RuntimeError("No source available to download input audio file.")
+
+            with state_lock:
+                progress_state.update(
+                    {
+                        "stage": "model_loading" if not transcriber.is_model_loaded() else "transcribing",
+                        "message": (
+                            "Preparing model for first run..."
+                            if not transcriber.is_model_loaded()
+                            else "Transcription started..."
+                        ),
+                        "done_chunks": 0,
+                        "total_chunks": 0,
+                    }
                 )
+            await progress.edit_text(
+                f"Processing... (quality={quality}, language={language}, format={output_format})"
+            )
+            updater_task = asyncio.create_task(
+                _progress_message_updater(progress, progress_state, state_lock, stop_event)
+            )
+
+            def _progress_callback(payload: dict[str, object]) -> None:
+                with state_lock:
+                    progress_state.update(payload)
 
             result = await asyncio.to_thread(
                 transcriber.transcribe_file,
                 input_path,
                 language,
                 quality,
+                output_format,
+                speaker_mode,
+                _progress_callback,
             )
+            stop_event.set()
+            if updater_task is not None:
+                await updater_task
 
             runtime = transcriber.status()
+            format_note = output_format
+            if output_format == "dialog" and result.speaker_count <= 1:
+                format_note = "dialog (auto-switched to plain text: 1 speaker)"
+            nemo_note = ""
+            if runtime.get("nemo_available") is False:
+                reason = runtime.get("nemo_reason") or "NeMo is unavailable."
+                nemo_note = f"\nNeMo status: unavailable ({reason})"
             summary = (
                 f"Done.\n"
                 f"Detected language: {result.language}\n"
+                f"Speakers detected: {result.speaker_count}\n"
+                f"Diarization backend: {result.diarization_backend}\n"
+                f"Speaker mode: {'auto' if speaker_mode == 0 else speaker_mode}\n"
                 f"Quality mode: {quality}\n"
+                f"Format: {format_note}\n"
                 f"Device: {runtime['active_device']}\n"
                 f"Chunks used: {result.chunk_count}"
+                f"{nemo_note}"
             )
 
             chunks = _split_for_telegram(result.text)
@@ -421,24 +1387,48 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     else:
                         await message.reply_text(f"[Part {i}/{len(chunks)}]\n{chunk}")
             else:
-                transcript_file = tmp_path / "transcript.txt"
-                transcript_file.write_text(result.text, encoding="utf-8")
+                transcript_bytes = io.BytesIO(result.text.encode("utf-8"))
+                transcript_bytes.seek(0)
                 await progress.edit_text(summary)
                 await message.reply_document(
-                    document=InputFile(str(transcript_file), filename="transcript.txt"),
+                    document=InputFile(transcript_bytes, filename="transcript.txt"),
                     caption="Transcript was long, sending as file.",
                 )
     except Exception as exc:  # pylint: disable=broad-except
+        stop_event.set()
+        if updater_task is not None:
+            await updater_task
         logger.exception("Failed to process audio")
         await progress.edit_text(f"Error: {exc}")
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if err is None:
+        return
+    if isinstance(err, BadRequest) and "message is not modified" in str(err).lower():
+        logger.debug("Ignoring harmless Telegram edit race: %s", err)
+        return
+    if isinstance(err, (TimedOut, NetworkError)):
+        logger.warning("Transient Telegram network error: %s", err)
+        return
+    logger.exception("Unhandled error while processing update: %s", err)
+
+
 def main() -> None:
-    load_dotenv()
+    env_file = Path(__file__).with_name(".env")
+    # Override process env with .env values to avoid empty shell vars shadowing token.
+    load_dotenv(dotenv_path=env_file, override=True)
     _configure_cuda_paths()
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    _configure_ffmpeg_paths()
+    _start_local_bot_api_if_needed()
+    atexit.register(_stop_local_bot_api_process)
+
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip().strip('"').strip("'")
     if not token:
-        raise RuntimeError("Set TELEGRAM_BOT_TOKEN in environment or .env file.")
+        token = _read_env_value_from_file("TELEGRAM_BOT_TOKEN", env_file)
+    if not token:
+        raise RuntimeError(f"Set TELEGRAM_BOT_TOKEN in environment or {env_file}.")
 
     model_size = os.getenv("WHISPER_MODEL_SIZE", "small")
     device = os.getenv("WHISPER_DEVICE", "cpu")
@@ -451,6 +1441,21 @@ def main() -> None:
     temperature = float(os.getenv("WHISPER_TEMPERATURE", "0.0"))
     vad_filter = _env_bool("WHISPER_VAD_FILTER", False)
     condition_on_previous_text = _env_bool("WHISPER_CONDITION_ON_PREVIOUS_TEXT", False)
+    diarization_backend = os.getenv("DIARIZATION_BACKEND", "nemo")
+    nemo_num_speakers = int(os.getenv("NEMO_NUM_SPEAKERS", "0"))
+    telegram_local_mode = _env_bool("TELEGRAM_LOCAL_MODE", False)
+    telegram_api_base_url = os.getenv("TELEGRAM_API_BASE_URL", "").strip()
+    telegram_api_file_url = os.getenv("TELEGRAM_API_FILE_URL", "").strip()
+    telegram_connect_timeout = _env_float("TELEGRAM_CONNECT_TIMEOUT", 20.0 if telegram_local_mode else 5.0)
+    telegram_read_timeout = _env_float("TELEGRAM_READ_TIMEOUT", 120.0 if telegram_local_mode else 5.0)
+    telegram_write_timeout = _env_float("TELEGRAM_WRITE_TIMEOUT", 120.0 if telegram_local_mode else 5.0)
+    telegram_media_write_timeout = _env_float(
+        "TELEGRAM_MEDIA_WRITE_TIMEOUT", 180.0 if telegram_local_mode else 20.0
+    )
+    telegram_pool_timeout = _env_float("TELEGRAM_POOL_TIMEOUT", 15.0 if telegram_local_mode else 1.0)
+    telegram_get_updates_read_timeout = _env_float(
+        "TELEGRAM_GET_UPDATES_READ_TIMEOUT", 30.0 if telegram_local_mode else 5.0
+    )
 
     logger.info(
         "Initializing bot (model '%s' will load lazily on first transcription request).",
@@ -468,22 +1473,67 @@ def main() -> None:
         temperature=temperature,
         vad_filter=vad_filter,
         condition_on_previous_text=condition_on_previous_text,
+        diarization_backend=diarization_backend,
+        nemo_num_speakers=nemo_num_speakers,
     )
+    runtime = transcriber.status()
+    if runtime.get("nemo_available") is False:
+        logger.warning("NeMo backend is unavailable: %s", runtime.get("nemo_reason"))
     logger.info("Bot is starting.")
 
-    app = Application.builder().token(token).build()
+    app_builder = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(telegram_connect_timeout)
+        .read_timeout(telegram_read_timeout)
+        .write_timeout(telegram_write_timeout)
+        .media_write_timeout(telegram_media_write_timeout)
+        .pool_timeout(telegram_pool_timeout)
+        .get_updates_read_timeout(telegram_get_updates_read_timeout)
+    )
+    if telegram_local_mode:
+        if not telegram_api_base_url:
+            telegram_api_base_url = _local_api_base_url()
+        if not telegram_api_file_url:
+            telegram_api_file_url = _local_api_base_url()
+        telegram_api_base_url = _prefer_loopback_ipv4(telegram_api_base_url)
+        telegram_api_file_url = _prefer_loopback_ipv4(telegram_api_file_url)
+
+    normalized_bot_base_url = _normalize_bot_base_url(telegram_api_base_url) if telegram_api_base_url else ""
+    normalized_file_base_url = _normalize_file_base_url(telegram_api_file_url) if telegram_api_file_url else ""
+    if telegram_api_base_url:
+        app_builder = app_builder.base_url(normalized_bot_base_url)
+    if telegram_api_file_url:
+        app_builder = app_builder.base_file_url(normalized_file_base_url)
+    if telegram_local_mode:
+        healthy, reason = _check_local_bot_api_get_me(token, normalized_bot_base_url or _local_api_base_url())
+        if not healthy:
+            raise RuntimeError(
+                "Local Telegram Bot API preflight failed. "
+                f"Reason: {reason}. Check Docker/telegram-bot-api server and TELEGRAM_API_BASE_URL."
+            )
+        app_builder = app_builder.local_mode(True)
+        logger.info(
+            "Telegram local Bot API mode is enabled. Base URL: %s",
+            normalized_bot_base_url or _normalize_bot_base_url(_local_api_base_url()),
+        )
+    app = app_builder.build()
     app.bot_data["transcriber"] = transcriber
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("lang", set_language))
     app.add_handler(CommandHandler("quality", set_quality))
+    app.add_handler(CommandHandler("format", set_format))
+    app.add_handler(CommandHandler("diar", set_diarization_backend))
+    app.add_handler(CommandHandler("speakers", set_speakers))
     app.add_handler(CommandHandler("gpu", gpu_status_command))
     app.add_handler(
         CallbackQueryHandler(
             settings_callback,
-            pattern=r"^(lang:|quality:|settings:)",
+            pattern=r"^(lang:|quality:|format:|diar:|spk:|settings:)",
         )
     )
     app.add_handler(
@@ -495,11 +1545,15 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_instructions))
 
     # Python 3.14 no longer provides an implicit default event loop.
-    # python-telegram-bot expects one when calling run_polling().
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app.run_polling(drop_pending_updates=True)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    finally:
+        _stop_local_bot_api_process()
 
 
 if __name__ == "__main__":
     main()
+
+
