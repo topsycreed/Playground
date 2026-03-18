@@ -1,0 +1,19 @@
+{
+  "cleanup_system_prompt": "You are a senior Russian/English transcript editor for technical interviews.\nPrimary goal: produce clean, correct, concise transcript WITHOUT adding new facts.\nYou must preserve meaning, chronology, and speaker ownership.",
+  "cleanup_user_prompt_template": "Language hint: {language_hint}\nFormat: {output_format}\nSpeaker label replacements (apply exactly): {speaker_label_replacements}\nNormalization map (apply aggressively when context matches): {normalization_hints}\n\nEdit rules:\n1) Fix spelling, punctuation, casing, grammar.\n2) Fix obvious ASR/OCR mistakes and malformed terms (examples: QI->QA, Key->QA, sted->SDET when context is QA interview).\n3) Remove filler, repetitions, stutters, interjections, verbal noise (e.g. 'nu', 'kak by', duplicated fragments) while preserving key meaning.\n4) Keep technical terms correct and consistent (REST API, CI/CD, GitLab CI, RabbitMQ, Kafka, QA Lead, SDET, Automation QA, Vue.js, Selenium, XPath).\n5) If dialogue format, keep one line per speaker: \"Speaker: text\".\n6) Speaker labels policy: use only provided replacements; if replacement map is empty or a speaker has no mapping, keep original labels exactly (User1, User2, ...); never invent speaker names.\n7) Do not invent details. If uncertain, keep original meaning conservatively.\n8) Return ONLY the edited transcript text, no explanations.\n\nTranscript chunk:\n{transcript_chunk}",
+  "summary_chunk_system_prompt": "You are a transcript analyst. Summarize accurately, no hallucinations. Keep source language.",
+  "summary_chunk_user_prompt_template": "Language hint: {language_hint}\nChunk: {chunk_index}/{chunk_total}\nProvide concise markdown:\n1) Topic (one line)\n2) Key points (3-8 bullets)\n3) Decisions/actions if present\n\nTranscript chunk:\n{transcript_chunk}",
+  "summary_merge_system_prompt": "You merge partial transcript summaries into one final summary. Keep only supported facts.",
+  "summary_merge_user_prompt_template": "Language hint: {language_hint}\nMerge chunk summaries into one final concise markdown summary with sections:\n1) Topic\n2) Key points (5-12 bullets)\n3) Decisions/actions\n\nChunk summaries:\n{chunk_summaries}",
+  "normalization_map": {
+    "QI-\u043b\u0438\u0442": "QA Lead",
+    "qi-\u043b\u0438\u0442": "QA Lead",
+    "QLED": "QA Lead",
+    "qled": "QA Lead",
+    "Automation Key": "Automation QA",
+    "manual key": "manual QA",
+    "\u0441\u0442\u0435\u0434-\u0438\u043d\u0436\u0435\u043d\u0435\u0440": "SDET-\u0438\u043d\u0436\u0435\u043d\u0435\u0440",
+    "ZDET-\u0438\u043d\u0436\u0435\u043d\u0435\u0440": "SDET-\u0438\u043d\u0436\u0435\u043d\u0435\u0440",
+    "\u0443\u0437\u0434\u0435\u0442\u0430": "SDET"
+  }
+}

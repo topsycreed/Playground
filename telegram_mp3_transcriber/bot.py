@@ -31,6 +31,7 @@ from telegram.ext import (
 )
 
 from transcriber import SpeechTranscriber
+from text_postprocessor import TextPostProcessor
 
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
@@ -46,11 +47,31 @@ SUPPORTED_QUALITIES = {"fast", "balanced", "best"}
 SUPPORTED_FORMATS = {"text", "dialog"}
 SUPPORTED_DIARIZATION = {"auto", "nemo", "heuristic"}
 SUPPORTED_SPEAKERS = {0, 2, 3, 4}
+SUPPORTED_POSTPROCESS_MODELS = {"gemini", "whisper", "oos20"}
+SUPPORTED_TEXT_DEBUG_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".log",
+    ".csv",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".srt",
+    ".vtt",
+}
+SUPPORTED_TEXT_DEBUG_MIME_TYPES = {
+    "application/json",
+    "application/xml",
+    "application/x-yaml",
+}
 
 user_language: dict[int, str] = {}
 user_quality: dict[int, str] = {}
 user_format: dict[int, str] = {}
 user_speakers: dict[int, int] = {}
+user_postprocess_model: dict[int, str] = {}
 local_bot_api_process: subprocess.Popen | None = None
 
 
@@ -102,6 +123,30 @@ def _get_user_quality(user_id: int) -> str:
 
 def _get_user_format(user_id: int) -> str:
     return user_format.get(user_id, "dialog")
+
+
+def _default_postprocess_model() -> str:
+    raw = os.getenv("TEXT_POSTPROCESS_MODEL", "gemini").strip().lower()
+    if raw not in SUPPORTED_POSTPROCESS_MODELS:
+        return "gemini"
+    return raw
+
+
+def _get_user_postprocess_model(user_id: int) -> str:
+    if user_id in user_postprocess_model:
+        chosen = user_postprocess_model[user_id]
+        if chosen in SUPPORTED_POSTPROCESS_MODELS:
+            return chosen
+    return _default_postprocess_model()
+
+
+def _postprocess_model_label(value: str) -> str:
+    mapping = {
+        "gemini": "Google Gemini",
+        "whisper": "Whisper",
+        "oos20": "OpenAI oos-20",
+    }
+    return mapping.get(value, value)
 
 
 def _default_speakers(transcriber: SpeechTranscriber | None) -> int:
@@ -207,6 +252,7 @@ def _settings_text(user_id: int, transcriber: SpeechTranscriber | None = None) -
     diarization_backend = _current_diarization_backend(transcriber)
     speakers = _get_user_speakers(user_id, transcriber)
     speakers_label = "auto" if speakers == 0 else str(speakers)
+    post_model = _get_user_postprocess_model(user_id)
     return (
         "Settings menu:\n"
         f"Language: {_get_user_language(user_id)}\n"
@@ -214,6 +260,7 @@ def _settings_text(user_id: int, transcriber: SpeechTranscriber | None = None) -
         f"Format: {_get_user_format(user_id)}\n"
         f"Diarization: {diarization_backend}\n"
         f"Speakers: {speakers_label}\n\n"
+        f"Post-process model: {_postprocess_model_label(post_model)}\n\n"
         "RU: Отправьте MP3/аудио/voice, и я сделаю транскрипт.\n"
         "EN: Send MP3/audio/voice and I will transcribe it."
     )
@@ -228,6 +275,7 @@ def _settings_keyboard(
     out_format = _get_user_format(user_id)
     diarization_backend = _current_diarization_backend(transcriber)
     speaker_mode = _get_user_speakers(user_id, transcriber)
+    post_model = _get_user_postprocess_model(user_id)
 
     def mark(active: bool, label: str) -> str:
         return f"[x] {label}" if active else f"[ ] {label}"
@@ -261,6 +309,11 @@ def _settings_keyboard(
                 InlineKeyboardButton(mark(speaker_mode == 2, "Spk 2"), callback_data="spk:2"),
                 InlineKeyboardButton(mark(speaker_mode == 3, "Spk 3"), callback_data="spk:3"),
                 InlineKeyboardButton(mark(speaker_mode == 4, "Spk 4"), callback_data="spk:4"),
+            ],
+            [
+                InlineKeyboardButton(mark(post_model == "gemini", "Google Gemini"), callback_data="model:gemini"),
+                InlineKeyboardButton(mark(post_model == "whisper", "Whisper"), callback_data="model:whisper"),
+                InlineKeyboardButton(mark(post_model == "oos20", "OpenAI oos-20"), callback_data="model:oos20"),
             ],
             [
                 InlineKeyboardButton("Show current", callback_data="settings:show"),
@@ -372,6 +425,60 @@ def _extract_file_size(update: Update) -> int:
     if message.document and message.document.file_size:
         return int(message.document.file_size)
     return 0
+
+
+def _extract_document_info(update: Update) -> tuple[str, str, int, str, str]:
+    message = update.effective_message
+    if message is None or message.document is None:
+        raise ValueError("No document payload found.")
+    doc = message.document
+    name = (doc.file_name or "document.txt").strip() or "document.txt"
+    ext = Path(name).suffix.lower()
+    if not ext:
+        ext = ".txt"
+    size = int(doc.file_size or 0)
+    mime_type = (doc.mime_type or "").strip().lower()
+    return doc.file_id, ext, size, mime_type, name
+
+
+def _is_supported_text_document(mime_type: str, extension: str) -> bool:
+    ext = (extension or "").lower()
+    if ext in SUPPORTED_TEXT_DEBUG_EXTENSIONS:
+        return True
+    mt = (mime_type or "").lower()
+    if mt.startswith("text/"):
+        return True
+    if mt in SUPPORTED_TEXT_DEBUG_MIME_TYPES:
+        return True
+    return False
+
+
+def _text_debug_max_bytes() -> int:
+    raw = os.getenv("TEXT_DEBUG_MAX_MB", "50").strip()
+    try:
+        mb = int(raw)
+    except ValueError:
+        mb = 50
+    mb = max(1, mb)
+    return mb * 1024 * 1024
+
+
+def _decode_text_payload(raw: bytes) -> tuple[str, str]:
+    encodings = [
+        "utf-8-sig",
+        "utf-8",
+        "utf-16",
+        "utf-16-le",
+        "utf-16-be",
+        "cp1251",
+        "windows-1251",
+    ]
+    for encoding in encodings:
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace"), "utf-8(replace)"
 
 
 def _telegram_download_limit_bytes() -> int:
@@ -781,6 +888,39 @@ def _split_for_telegram(text: str, max_chars: int = 3900) -> list[str]:
     return chunks
 
 
+async def _send_text_or_file(
+    message,
+    text: str,
+    *,
+    filename: str,
+    short_prefix: str = "",
+    caption: str,
+) -> None:
+    payload = text.strip()
+    if not payload:
+        payload = "(empty)"
+    chunks = _split_for_telegram(payload)
+    if len(chunks) <= 8:
+        for idx, chunk in enumerate(chunks, start=1):
+            if len(chunks) == 1:
+                body = chunk
+                if short_prefix:
+                    body = f"{short_prefix}\n{chunk}"
+            else:
+                body = f"[Part {idx}/{len(chunks)}]\n{chunk}"
+                if short_prefix and idx == 1:
+                    body = f"{short_prefix}\n{body}"
+            await message.reply_text(body)
+        return
+
+    payload_bytes = io.BytesIO(payload.encode("utf-8"))
+    payload_bytes.seek(0)
+    await message.reply_document(
+        document=InputFile(payload_bytes, filename=filename),
+        caption=caption,
+    )
+
+
 def _render_progress_bar(done: int, total: int, width: int = 18) -> str:
     if total <= 0:
         return "[------------------] 0%"
@@ -871,6 +1011,64 @@ def _format_gpu_status(transcriber: SpeechTranscriber) -> str:
     )
 
 
+def _format_llm_status(status: dict[str, object]) -> str:
+    enabled = bool(status.get("enabled"))
+    provider = str(status.get("provider", "unknown"))
+    base_url = str(status.get("base_url", ""))
+    api_base_url = str(status.get("api_base_url", "")).strip()
+    prompts_file = str(status.get("prompts_file", "")).strip()
+    normalization_entries = int(status.get("normalization_entries", 0) or 0)
+    timeout_sec = float(status.get("timeout_sec", 0) or 0)
+    request_retries = int(status.get("request_retries", 0) or 0)
+    chunk_chars = int(status.get("chunk_chars", 0) or 0)
+    summary_chunk_chars = int(status.get("summary_chunk_chars", 0) or 0)
+    configured_model = str(status.get("configured_model", "(auto)"))
+    effective_model = str(status.get("effective_model", "")) or "(not resolved)"
+    gemini_model = str(status.get("gemini_model", "")).strip() or "(not set)"
+    gemini_api_key_set = bool(status.get("gemini_api_key_set"))
+    gemini_api_keys_count = int(status.get("gemini_api_keys_count", 0) or 0)
+    gemini_timeout_sec = float(status.get("gemini_timeout_sec", 0) or 0)
+    gemini_fallback_model = str(status.get("gemini_fallback_model", "whisper") or "whisper")
+    available = bool(status.get("available"))
+    models = status.get("models") or []
+    error = str(status.get("error", "")).strip()
+
+    lines = [
+        "LLM post-processing status:",
+        f"Enabled: {'yes' if enabled else 'no'}",
+        f"Provider: {provider}",
+        f"Base URL: {base_url}",
+        f"Resolved API endpoint: {api_base_url or '(not resolved yet)'}",
+        f"Prompts file: {prompts_file or '(default)'}",
+        f"Normalization entries: {normalization_entries}",
+        f"Timeout (sec): {timeout_sec:g}",
+        f"Retries: {request_retries}",
+        f"Cleanup chunk chars: {chunk_chars}",
+        f"Summary chunk chars: {summary_chunk_chars}",
+        f"Configured model: {configured_model}",
+        f"Effective model: {effective_model}",
+        f"Gemini model: {gemini_model}",
+        f"Gemini key configured: {'yes' if gemini_api_key_set else 'no'}",
+        f"Gemini keys count: {gemini_api_keys_count}",
+        f"Gemini timeout (sec): {gemini_timeout_sec:g}",
+        f"Gemini fallback model: {gemini_fallback_model}",
+        f"LM Studio reachable: {'yes' if available else 'no'}",
+    ]
+    if isinstance(models, list) and models:
+        preview = ", ".join(str(m) for m in models[:4])
+        if len(models) > 4:
+            preview += f", ... (+{len(models) - 4} more)"
+        lines.append(f"Models: {preview}")
+    if error:
+        lines.append(f"Note: {error}")
+    lines.append(
+        "Hint: configure GEMINI_API_KEYS for Google Gemini free tier "
+        "(single key or multiple keys separated by comma/semicolon/newline). "
+        "Set /model gemini|whisper|oos20 in bot settings."
+    )
+    return "\n".join(lines)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -880,7 +1078,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(
         "Send me an MP3/audio file and I will convert speech to text.\n"
         "Use /help for interactive settings menu.\n"
+        "Send a text document (.txt/.md/.log/.json) to run debug cleanup+summary mode.\n"
         "Use /gpu to check CUDA/CPU runtime status.\n"
+        "Use /llm to check LM Studio post-processing status.\n"
+        "Use /model gemini|whisper|oos20 to choose post-process model.\n"
         "Use /diar auto|nemo|heuristic to choose diarization backend.\n"
         "Use /speakers auto|2|3|4 to guide speaker count.\n"
         "Default output format is dialog (User1/User2)."
@@ -901,10 +1102,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/lang auto|ru|en\n"
         "/quality fast|balanced|best\n"
         "/format text|dialog\n"
+        "/model gemini|whisper|oos20\n"
         "/diar auto|nemo|heuristic\n"
         "/speakers auto|2|3|4\n"
         "/gpu - show runtime device status\n\n"
-        "Send audio as voice, audio, or file attachment."
+        "/llm - show LM Studio post-processing status\n\n"
+        "Send audio as voice, audio, or file attachment.\n"
+        "Debug text mode: send text file (.txt/.md/.log/.json) for cleanup + summary."
     )
     await _send_menu(message, user.id, transcriber)
 
@@ -928,13 +1132,191 @@ async def text_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await message.reply_text(
         "RU:\n"
         "Я распознаю речь из аудио файлов.\n"
-        "Пожалуйста, отправьте MP3/аудио/voice-сообщение.\n\n"
+        "Пожалуйста, отправьте MP3/аудио/voice-сообщение.\n"
+        "Для debug-режима можно отправить текстовый файл (.txt/.md/.log/.json): "
+        "я отдельно сделаю очистку и summary.\n\n"
         "EN:\n"
         "I transcribe speech from audio files.\n"
-        "Please send an MP3/audio/voice message.\n\n"
+        "Please send an MP3/audio/voice message.\n"
+        "For debug mode you can send a text file (.txt/.md/.log/.json): "
+        "I will run separate cleanup and summary.\n\n"
         "Use /help for settings."
     )
     await _send_menu(message, user.id, transcriber)
+
+
+async def debug_text_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or message.document is None:
+        return
+
+    file_id, file_ext, file_size, mime_type, file_name = _extract_document_info(update)
+    if not _is_supported_text_document(mime_type, file_ext):
+        await message.reply_text(
+            "RU:\n"
+            "Это не текстовый файл для debug-обработки.\n"
+            "Поддерживаются: .txt .md .log .csv .json .yaml .xml .srt .vtt\n\n"
+            "EN:\n"
+            "This is not a supported text file for debug processing.\n"
+            "Supported: .txt .md .log .csv .json .yaml .xml .srt .vtt"
+        )
+        return
+
+    max_size = _text_debug_max_bytes()
+    if file_size > 0 and file_size > max_size:
+        await message.reply_text(
+            "RU:\n"
+            f"Текстовый файл слишком большой для debug-режима "
+            f"({_size_to_mb_text(file_size)} > {_size_to_mb_text(max_size)}).\n"
+            "Уменьшите файл или поднимите лимит через TEXT_DEBUG_MAX_MB.\n\n"
+            "EN:\n"
+            f"Text file is too large for debug mode "
+            f"({_size_to_mb_text(file_size)} > {_size_to_mb_text(max_size)}).\n"
+            "Reduce file size or increase TEXT_DEBUG_MAX_MB."
+        )
+        return
+
+    logger.info(
+        "Debug text mode started: user_id=%s file=%s size=%s mime=%s ext=%s",
+        user.id,
+        file_name,
+        file_size,
+        mime_type,
+        file_ext,
+    )
+    progress = await message.reply_text("Debug text mode: downloading document...")
+    try:
+        bot_is_local_mode = bool(getattr(context.bot, "local_mode", False))
+        tg_file = None
+        direct_source: Path | None = None
+
+        if bot_is_local_mode and file_size > 0 and file_size >= _local_direct_pickup_threshold_bytes():
+            direct_source = await _wait_for_recent_local_media_file(
+                file_ext=file_ext,
+                expected_size=file_size,
+                timeout_seconds=_local_direct_pickup_wait_seconds(),
+            )
+
+        if direct_source is None:
+            try:
+                tg_file = await _get_file_with_retries(context.bot, file_id)
+            except (TimedOut, NetworkError) as exc:
+                if bot_is_local_mode:
+                    direct_source = await _wait_for_recent_local_media_file(
+                        file_ext=file_ext,
+                        expected_size=file_size,
+                        timeout_seconds=_local_direct_pickup_wait_seconds(),
+                    )
+                    if direct_source is None:
+                        raise RuntimeError(
+                            "Timeout while loading text file from Telegram/local storage."
+                        ) from exc
+                else:
+                    raise
+
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / f"debug_input{file_ext}"
+
+            if direct_source is not None:
+                shutil.copyfile(direct_source, input_path)
+            elif tg_file is not None:
+                try:
+                    await tg_file.download_to_drive(custom_path=str(input_path))
+                except (InvalidToken, BadRequest) as exc:
+                    msg_lower = str(exc).lower()
+                    fallback_source = None
+                    if bot_is_local_mode and ("not found" in msg_lower or "invalid token" in msg_lower):
+                        fallback_source = _resolve_local_bot_api_file_path(tg_file.file_path)
+                        if fallback_source is None:
+                            fallback_source = await _wait_for_recent_local_media_file(
+                                file_ext=file_ext,
+                                expected_size=file_size,
+                                timeout_seconds=_local_direct_pickup_wait_seconds(),
+                            )
+                    if fallback_source is None:
+                        raise
+                    shutil.copyfile(fallback_source, input_path)
+            else:
+                raise RuntimeError("No source available to download text file.")
+
+            raw_payload = input_path.read_bytes()
+            logger.info(
+                "Debug text mode: download finished for user_id=%s file=%s bytes=%s",
+                user.id,
+                file_name,
+                len(raw_payload),
+            )
+
+        await progress.edit_text("Debug text mode: cleaning and summarizing...")
+        raw_text, decoded_as = _decode_text_payload(raw_payload)
+        raw_text = raw_text.replace("\x00", "").strip()
+        logger.info(
+            "Debug text mode: decoded file=%s using=%s chars=%s",
+            file_name,
+            decoded_as,
+            len(raw_text),
+        )
+        if not raw_text:
+            await progress.edit_text("Debug text mode: file is empty after decoding.")
+            return
+
+        language = _get_user_language(user.id)
+        post_model = _get_user_postprocess_model(user.id)
+        postprocessor: TextPostProcessor | None = context.application.bot_data.get("postprocessor")
+        if postprocessor is None:
+            postprocessor = TextPostProcessor()
+
+        process_started_at = time.perf_counter()
+        cleaned_text, summary_text, debug_report = await asyncio.to_thread(
+            postprocessor.process_debug_text,
+            raw_text,
+            language,
+            post_model,
+        )
+        logger.info(
+            "Debug text mode finished: user_id=%s file=%s model=%s cleanup=%s summary=%s elapsed=%.1fs cleaned_chars=%s summary_chars=%s",
+            user.id,
+            file_name,
+            post_model,
+            debug_report.cleanup_method,
+            debug_report.summary_method,
+            time.perf_counter() - process_started_at,
+            len(cleaned_text),
+            len(summary_text),
+        )
+
+        note = (
+            "Debug text mode complete.\n"
+            f"File: {file_name}\n"
+            f"Decoded as: {decoded_as}\n"
+            f"Model: {_postprocess_model_label(post_model)}\n"
+            f"Cleanup: {debug_report.cleanup_method}\n"
+            f"Summary: {debug_report.summary_method}"
+        )
+        if debug_report.error:
+            note += f"\nNote: {debug_report.error}"
+        await progress.edit_text(note)
+
+        await _send_text_or_file(
+            message,
+            summary_text,
+            filename="summary.txt",
+            short_prefix="Summary:",
+            caption="Summary was long, sending as file.",
+        )
+        await _send_text_or_file(
+            message,
+            cleaned_text,
+            filename="cleaned_text.txt",
+            short_prefix="Cleaned text:",
+            caption="Cleaned text was long, sending as file.",
+        )
+
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Failed to process text document in debug mode")
+        await progress.edit_text(f"Debug text mode error: {exc}")
 
 
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -988,6 +1370,25 @@ async def set_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     user_format[user.id] = chosen
     await message.reply_text(f"Output format set to: {chosen}")
+    await _send_menu(message, user.id, transcriber)
+
+
+async def set_postprocess_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
+    if not context.args:
+        current = _get_user_postprocess_model(user.id)
+        await message.reply_text(f"Current post-process model: {_postprocess_model_label(current)}")
+        return
+    chosen = context.args[0].strip().lower()
+    if chosen not in SUPPORTED_POSTPROCESS_MODELS:
+        await message.reply_text("Use: /model gemini | /model whisper | /model oos20")
+        return
+    user_postprocess_model[user.id] = chosen
+    await message.reply_text(f"Post-process model set to: {_postprocess_model_label(chosen)}")
     await _send_menu(message, user.id, transcriber)
 
 
@@ -1065,6 +1466,18 @@ async def gpu_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text(_format_gpu_status(transcriber))
 
 
+async def llm_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    postprocessor: TextPostProcessor | None = context.application.bot_data.get("postprocessor")
+    if postprocessor is None:
+        await message.reply_text("LLM post-processor is not initialized.")
+        return
+    status = await asyncio.to_thread(postprocessor.runtime_status)
+    await message.reply_text(_format_llm_status(status))
+
+
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
@@ -1100,6 +1513,16 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await _safe_query_answer(query, f"Format: {chosen}")
         else:
             await _safe_query_answer(query, "Unsupported format", show_alert=True)
+        await _safe_edit_settings_menu(query, user.id, transcriber)
+        return
+
+    if data.startswith("model:"):
+        chosen = data.split(":", 1)[1].strip().lower()
+        if chosen in SUPPORTED_POSTPROCESS_MODELS:
+            user_postprocess_model[user.id] = chosen
+            await _safe_query_answer(query, f"Model: {_postprocess_model_label(chosen)}")
+        else:
+            await _safe_query_answer(query, "Unsupported model", show_alert=True)
         await _safe_edit_settings_menu(query, user.id, transcriber)
         return
 
@@ -1162,6 +1585,7 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     quality = _get_user_quality(user.id)
     output_format = _get_user_format(user.id)
     speaker_mode = _get_user_speakers(user.id, transcriber)
+    post_model = _get_user_postprocess_model(user.id)
 
     progress = await message.reply_text("Downloading audio...")
     state_lock = threading.Lock()
@@ -1353,6 +1777,42 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 speaker_mode,
                 _progress_callback,
             )
+            postprocess_note = ""
+            postprocessor: TextPostProcessor | None = context.application.bot_data.get("postprocessor")
+            if postprocessor is not None and postprocessor.enabled:
+                with state_lock:
+                    progress_state.update(
+                        {
+                            "stage": "finalizing",
+                            "message": "Post-processing transcript text...",
+                        }
+                    )
+                processed_text, post_report = await asyncio.to_thread(
+                    postprocessor.process_text,
+                    result.text,
+                    result.language,
+                    output_format,
+                    post_model,
+                )
+                result.text = processed_text
+                if post_report.applied:
+                    rename_info = ""
+                    if post_report.renamed_speakers:
+                        rename_info = f", renamed speakers: {len(post_report.renamed_speakers)}"
+                    postprocess_note = (
+                        f"\nPost-processing model: {_postprocess_model_label(post_model)}"
+                        f"\nPost-processing: {post_report.method}{rename_info}"
+                    )
+                elif post_report.error:
+                    postprocess_note = (
+                        f"\nPost-processing model: {_postprocess_model_label(post_model)}"
+                        f"\nPost-processing fallback: {post_report.method} ({post_report.error})"
+                    )
+                else:
+                    postprocess_note = (
+                        f"\nPost-processing model: {_postprocess_model_label(post_model)}"
+                        f"\nPost-processing: {post_report.method}"
+                    )
             stop_event.set()
             if updater_task is not None:
                 await updater_task
@@ -1376,6 +1836,7 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"Device: {runtime['active_device']}\n"
                 f"Chunks used: {result.chunk_count}"
                 f"{nemo_note}"
+                f"{postprocess_note}"
             )
 
             chunks = _split_for_telegram(result.text)
@@ -1476,9 +1937,25 @@ def main() -> None:
         diarization_backend=diarization_backend,
         nemo_num_speakers=nemo_num_speakers,
     )
+    postprocessor = TextPostProcessor()
     runtime = transcriber.status()
     if runtime.get("nemo_available") is False:
         logger.warning("NeMo backend is unavailable: %s", runtime.get("nemo_reason"))
+    if postprocessor.enabled:
+        default_post_model = _default_postprocess_model()
+        llm_status = postprocessor.runtime_status()
+        logger.info(
+            "Text post-processing is enabled (default model=%s, provider=%s, base=%s, prompts=%s).",
+            _postprocess_model_label(default_post_model),
+            postprocessor.provider,
+            postprocessor.base_url,
+            postprocessor.prompts_file,
+        )
+        if default_post_model == "oos20" and not llm_status.get("available"):
+            logger.warning(
+                "LM Studio preflight failed. Fallback mode will be used. Reason: %s",
+                llm_status.get("error", "unknown"),
+            )
     logger.info("Bot is starting.")
 
     app_builder = (
@@ -1519,6 +1996,7 @@ def main() -> None:
         )
     app = app_builder.build()
     app.bot_data["transcriber"] = transcriber
+    app.bot_data["postprocessor"] = postprocessor
     app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", start))
@@ -1527,19 +2005,27 @@ def main() -> None:
     app.add_handler(CommandHandler("lang", set_language))
     app.add_handler(CommandHandler("quality", set_quality))
     app.add_handler(CommandHandler("format", set_format))
+    app.add_handler(CommandHandler("model", set_postprocess_model))
     app.add_handler(CommandHandler("diar", set_diarization_backend))
     app.add_handler(CommandHandler("speakers", set_speakers))
     app.add_handler(CommandHandler("gpu", gpu_status_command))
+    app.add_handler(CommandHandler("llm", llm_status_command))
     app.add_handler(
         CallbackQueryHandler(
             settings_callback,
-            pattern=r"^(lang:|quality:|format:|diar:|spk:|settings:)",
+            pattern=r"^(lang:|quality:|format:|model:|diar:|spk:|settings:)",
         )
     )
     app.add_handler(
         MessageHandler(
             filters.AUDIO | filters.VOICE | filters.Document.AUDIO,
             transcribe_audio,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.Document.ALL & (~filters.Document.AUDIO),
+            debug_text_document,
         )
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_instructions))

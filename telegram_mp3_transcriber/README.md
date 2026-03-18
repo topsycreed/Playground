@@ -16,6 +16,11 @@ Features:
 - Quality profiles (`fast`, `balanced`, `best`)
 - Output formats: plain text or dialogue (`User1` / `User2`)
 - Hybrid mode: Whisper transcription + optional NeMo diarization backend
+- Optional LLM post-processing:
+  - Google Gemini (AI Studio free tier)
+  - Whisper (no LLM cleanup, raw transcript)
+  - OpenAI oos-20 via LM Studio
+- Debug text-file mode: cleanup + summary for `.txt/.md/.log/.json` documents
 - Large-file handling: split into chunks + automatic text merge
 - GPU (CUDA) acceleration with automatic CPU fallback
 - Lazy model loading: bot starts immediately; model downloads/loads on first transcription
@@ -112,6 +117,17 @@ NEMO_NUM_WORKERS=0
 
 `NEMO_NUM_WORKERS=0` is recommended on Windows to avoid multiprocessing/pickling errors during NeMo diarization.
 
+Gemini free-tier post-processing options:
+
+```env
+TEXT_POSTPROCESS_MODEL=gemini
+# One key or multiple keys (comma/semicolon/newline separated):
+GEMINI_API_KEYS=PUT_YOUR_KEY_1,PUT_YOUR_KEY_2
+GEMINI_MODEL=gemini-2.0-flash
+GEMINI_TIMEOUT_SEC=120
+GEMINI_FALLBACK_MODEL=whisper
+```
+
 ## 4) Enable CUDA (NVIDIA GPU) on Windows
 
 If CUDA is not configured, bot still works on CPU, but slower.
@@ -195,6 +211,7 @@ CPU-safe profile:
 WHISPER_MODEL_SIZE=small
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
+CT2_ENABLE_TRANSFORMERS_CONVERTER=false
 ```
 
 ## 6) Run Bot
@@ -209,19 +226,23 @@ They are cached locally, so re-download is not needed every start (unless cache 
 ## 7) Use Bot in Telegram
 
 - Send MP3/audio/voice file
+- Or send a text document (`.txt/.md/.log/.json/.csv/.yaml/.xml/.srt/.vtt`) for debug cleanup+summary
 - `/help` or `/settings` opens interactive menu
 - Menu language options: `auto`, `ru`, `en`
 - Menu quality options: `fast`, `balanced`, `best`
 - Menu format options: `text`, `dialog`
 - Menu diarization options: `auto`, `nemo`, `heuristic`
 - Menu speaker options: `auto`, `2`, `3`, `4`
+- Menu post-process model options: `Google Gemini`, `Whisper`, `OpenAI oos-20`
 - Text commands also work:
 `/lang auto|ru|en`
 `/quality fast|balanced|best`
 `/format text|dialog`
+/model gemini|whisper|oos20
 `/diar auto|nemo|heuristic`
 `/speakers auto|2|3|4`
 `/gpu` (show current model/device/compute runtime status, including NeMo availability)
+- `/llm` (show LM Studio post-processing status and selected model)
 - `/gpu` also reports if `cublas64_12.dll` and `cudnn64_9.dll` are visible in PATH
 
 ## 8) Large Files (up to 300 MB and more)
@@ -267,6 +288,38 @@ TELEGRAM_LOCAL_DIRECT_PICKUP_MB=40
 TELEGRAM_LOCAL_PICKUP_WAIT_SECONDS=30
 ```
 
+Optional post-processing of final transcript (free, local LM Studio):
+- Fix spelling/punctuation
+- Remove filler words ("water")
+- Replace `User1/User2` with names when speakers introduce themselves
+
+```env
+TEXT_POSTPROCESS_ENABLED=true
+TEXT_POSTPROCESS_PROVIDER=lmstudio
+LMSTUDIO_BASE_URL=http://127.0.0.1:1234
+LMSTUDIO_MODEL=
+LMSTUDIO_PROMPTS_FILE=
+LMSTUDIO_TIMEOUT_SEC=600
+LMSTUDIO_TEMPERATURE=0.0
+LMSTUDIO_REQUEST_RETRIES=3
+LMSTUDIO_RETRY_BACKOFF_SEC=1.5
+TEXT_POSTPROCESS_MAX_CHARS_PER_CHUNK=2500
+TEXT_SUMMARY_MAX_CHARS_PER_CHUNK=3500
+TEXT_POSTPROCESS_MIN_RESPLIT_CHARS=1200
+TEXT_DEBUG_MAX_MB=50
+```
+
+Notes:
+- Keep LM Studio running with a loaded chat model.
+- `LMSTUDIO_BASE_URL` can be `http://127.0.0.1:1234`, `.../v1`, or `.../api/v1`.
+- Bot auto-detects LM Studio API style (`/v1` or `/api/v1`).
+- If `LMSTUDIO_MODEL` is empty, bot auto-picks the first model from `/models`.
+- If LM Studio is unavailable, bot falls back to a lightweight heuristic cleanup.
+- For debug text-file mode, bot decodes file content, runs cleanup, then sends separate summary + cleaned text.
+- Prompt templates and normalization dictionary are stored in `lmstudio_prompts.json` (editable JSON).
+- You can override location via `LMSTUDIO_PROMPTS_FILE`.
+- For quality-first mode (slower): use lower `LMSTUDIO_TEMPERATURE`, smaller `TEXT_POSTPROCESS_MAX_CHARS_PER_CHUNK`, and higher `LMSTUDIO_TIMEOUT_SEC`.
+
 Important:
 - Before switching from cloud API to local API, call `logOut` once (per official docs).
 
@@ -284,6 +337,11 @@ Dialogue mode notes:
 - Install CUDA Toolkit 12.x
 - Ensure CUDA `bin` path is in `PATH`
 - Open a new terminal
+
+Bot hangs on startup around `import transformers` / `ctranslate2`
+- Current build disables CTranslate2 `TransformersConverter` by default because it is not required for transcription.
+- Keep `CT2_ENABLE_TRANSFORMERS_CONVERTER=false` in `.env` (recommended).
+- If you explicitly need model conversion via ctranslate2 converters, set it to `true`.
 
 `RuntimeError: cudnn64_9.dll is not found`
 - Install cuDNN 9.x for CUDA 12

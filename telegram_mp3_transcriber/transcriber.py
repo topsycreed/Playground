@@ -3,11 +3,48 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
+import sys
 import threading
+import types
 from typing import Any, Callable
 
 import numpy as np
+
+
+def _install_ctranslate2_transformers_converter_stub() -> None:
+    """
+    faster-whisper does not need CTranslate2 model converters at runtime,
+    but recent ctranslate2 imports TransformersConverter unconditionally.
+    On some Windows setups this can freeze for a long time while importing
+    huge `transformers` package metadata.
+    """
+    if os.getenv("CT2_ENABLE_TRANSFORMERS_CONVERTER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    module_name = "ctranslate2.converters.transformers"
+    if module_name in sys.modules:
+        return
+
+    stub = types.ModuleType(module_name)
+
+    class TransformersConverter:  # pragma: no cover - optional safety stub
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError(
+                "TransformersConverter is disabled in this runtime for faster startup. "
+                "Set CT2_ENABLE_TRANSFORMERS_CONVERTER=1 to enable it."
+            )
+
+    stub.TransformersConverter = TransformersConverter
+    sys.modules[module_name] = stub
+
+
+_install_ctranslate2_transformers_converter_stub()
 from faster_whisper import WhisperModel
 
 from audio_utils import SAMPLE_RATE, decode_audio_mono, split_audio_by_limits
