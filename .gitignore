@@ -1,0 +1,31 @@
+# Python caches/bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.nox/
+.tox/
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# Project-local heavy/runtime artifacts
+telegram-bot-api/
+tg-bot-api-data/
+telegram_mp3_transcriber/.cache_nemo/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
