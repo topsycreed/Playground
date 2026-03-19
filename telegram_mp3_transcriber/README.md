@@ -1,4 +1,4 @@
-# Telegram MP3 -> Text Bot (RU/EN, free, local)
+# Telegram Audio/Video -> Text Bot (RU/EN, free, local)
 
 ## Quick Start
 
@@ -8,18 +8,21 @@ cd .\telegram_mp3_transcriber\
 python bot.py
 ```
 
-This bot transcribes speech from Telegram audio files to text using `faster-whisper` (local inference, no paid API).
+This bot transcribes speech from Telegram audio/video files to text using `faster-whisper` (local inference, no paid API).
 
 Features:
 - Russian (`ru`), English (`en`), Auto language detection (`auto`)
 - Interactive Telegram settings menu (`/help` or `/settings`)
 - Quality profiles (`fast`, `balanced`, `best`)
 - Output formats: plain text or dialogue (`User1` / `User2`)
+- Input support: `audio`, `voice`, `video`, file attachments (`Document.AUDIO` / `Document.VIDEO`)
+- MP4/video pipeline: audio track is extracted with `ffmpeg` and then transcribed
 - Hybrid mode: Whisper transcription + optional NeMo diarization backend
 - Optional LLM post-processing:
   - Google Gemini (AI Studio free tier)
   - Whisper (no LLM cleanup, raw transcript)
   - OpenAI oos-20 via LM Studio
+- Full cycle output for audio/video: status message + `transcript.txt` file + summary (when post-processing is enabled)
 - Debug text-file mode: cleanup + summary for `.txt/.md/.log/.json` documents
 - Large-file handling: split into chunks + automatic text merge
 - GPU (CUDA) acceleration with automatic CPU fallback
@@ -123,8 +126,8 @@ Gemini free-tier post-processing options:
 TEXT_POSTPROCESS_MODEL=gemini
 # One key or multiple keys (comma/semicolon/newline separated):
 GEMINI_API_KEYS=PUT_YOUR_KEY_1,PUT_YOUR_KEY_2
-GEMINI_MODEL=gemini-2.0-flash
-GEMINI_TIMEOUT_SEC=120
+GEMINI_MODEL=gemini-3.1-flash-lite-preview
+GEMINI_TIMEOUT_SEC=180
 GEMINI_FALLBACK_MODEL=whisper
 ```
 
@@ -167,6 +170,8 @@ If `where` does not find DLLs, add CUDA `bin` to system `PATH` (then open a new 
 If this fails with `cublas64_12.dll` or `cudnn64_9.dll`, CUDA/cuDNN install or PATH is incomplete.
 
 ## 4.1) FFmpeg (required by NeMo/pydub path)
+
+Also required for video input (`.mp4`, `.mov`, `.mkv`, etc.) because bot extracts audio track before transcription.
 
 Install (if not installed):
 
@@ -225,8 +230,12 @@ They are cached locally, so re-download is not needed every start (unless cache 
 
 ## 7) Use Bot in Telegram
 
-- Send MP3/audio/voice file
+- Send MP3/audio/voice or MP4 video
 - Or send a text document (`.txt/.md/.log/.json/.csv/.yaml/.xml/.srt/.vtt`) for debug cleanup+summary
+- For audio/video requests bot returns:
+  - status message (`Done...`)
+  - `transcript.txt` (full transcript as file)
+  - summary (message or `summary.txt`, depending on length)
 - `/help` or `/settings` opens interactive menu
 - Menu language options: `auto`, `ru`, `en`
 - Menu quality options: `fast`, `balanced`, `best`
@@ -238,14 +247,14 @@ They are cached locally, so re-download is not needed every start (unless cache 
 `/lang auto|ru|en`
 `/quality fast|balanced|best`
 `/format text|dialog`
-/model gemini|whisper|oos20
+`/model gemini|whisper|oos20`
 `/diar auto|nemo|heuristic`
 `/speakers auto|2|3|4`
 `/gpu` (show current model/device/compute runtime status, including NeMo availability)
 - `/llm` (show LM Studio post-processing status and selected model)
 - `/gpu` also reports if `cublas64_12.dll` and `cudnn64_9.dll` are visible in PATH
 
-## 8) Large Files (up to 300 MB and more)
+## 8) Large Files (audio/video, 300 MB and more)
 
 Telegram cloud Bot API limits bot downloads to 20 MB.  
 For large files, run a local Telegram Bot API server.
@@ -292,19 +301,25 @@ Optional post-processing of final transcript (free, local LM Studio):
 - Fix spelling/punctuation
 - Remove filler words ("water")
 - Replace `User1/User2` with names when speakers introduce themselves
+- Generate concise summary
 
 ```env
 TEXT_POSTPROCESS_ENABLED=true
 TEXT_POSTPROCESS_PROVIDER=lmstudio
+TEXT_POSTPROCESS_MODEL=gemini
+GEMINI_API_KEYS=PUT_YOUR_KEY_1,PUT_YOUR_KEY_2
+GEMINI_MODEL=gemini-3.1-flash-lite-preview
+GEMINI_TIMEOUT_SEC=180
+GEMINI_FALLBACK_MODEL=whisper
 LMSTUDIO_BASE_URL=http://127.0.0.1:1234
 LMSTUDIO_MODEL=
 LMSTUDIO_PROMPTS_FILE=
 LMSTUDIO_TIMEOUT_SEC=600
 LMSTUDIO_TEMPERATURE=0.0
-LMSTUDIO_REQUEST_RETRIES=3
-LMSTUDIO_RETRY_BACKOFF_SEC=1.5
-TEXT_POSTPROCESS_MAX_CHARS_PER_CHUNK=2500
-TEXT_SUMMARY_MAX_CHARS_PER_CHUNK=3500
+LMSTUDIO_REQUEST_RETRIES=2
+LMSTUDIO_RETRY_BACKOFF_SEC=2.0
+TEXT_POSTPROCESS_MAX_CHARS_PER_CHUNK=12000
+TEXT_SUMMARY_MAX_CHARS_PER_CHUNK=20000
 TEXT_POSTPROCESS_MIN_RESPLIT_CHARS=1200
 TEXT_DEBUG_MAX_MB=50
 ```
@@ -316,6 +331,7 @@ Notes:
 - If `LMSTUDIO_MODEL` is empty, bot auto-picks the first model from `/models`.
 - If LM Studio is unavailable, bot falls back to a lightweight heuristic cleanup.
 - For debug text-file mode, bot decodes file content, runs cleanup, then sends separate summary + cleaned text.
+- Speaker rename is guarded: if detected replacement is not likely a real name, bot keeps `User1/User2/...`.
 - Prompt templates and normalization dictionary are stored in `lmstudio_prompts.json` (editable JSON).
 - You can override location via `LMSTUDIO_PROMPTS_FILE`.
 - For quality-first mode (slower): use lower `LMSTUDIO_TEMPERATURE`, smaller `TEXT_POSTPROCESS_MAX_CHARS_PER_CHUNK`, and higher `LMSTUDIO_TIMEOUT_SEC`.
@@ -353,6 +369,16 @@ Bot hangs on startup around `import transformers` / `ctranslate2`
 - Send smaller file, or split audio before sending to the bot
 - You can configure the check via `.env`:
   `TELEGRAM_DOWNLOAD_LIMIT_MB=20`
+
+`ffmpeg audio extraction failed` for MP4/video
+- Ensure `ffmpeg.exe` is available in `PATH` (`where.exe ffmpeg`)
+- If needed, set `FFMPEG_EXTRA_PATHS` in `.env`
+- Retry with a video that has an actual audio track
+
+Summary is missing after transcription
+- Ensure `TEXT_POSTPROCESS_ENABLED=true`
+- Check `/model` (for example `gemini`)
+- Verify model endpoint with `/llm`
 
 Bot starts but transcriptions are inaccurate
 - Use `WHISPER_MODEL_SIZE=large-v3`
