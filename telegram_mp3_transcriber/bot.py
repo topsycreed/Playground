@@ -48,6 +48,7 @@ SUPPORTED_FORMATS = {"text", "dialog"}
 SUPPORTED_DIARIZATION = {"auto", "nemo", "heuristic"}
 SUPPORTED_SPEAKERS = {0, 2, 3, 4}
 SUPPORTED_POSTPROCESS_MODELS = {"gemini", "whisper", "oos20"}
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi"}
 SUPPORTED_TEXT_DEBUG_EXTENSIONS = {
     ".txt",
     ".md",
@@ -261,8 +262,8 @@ def _settings_text(user_id: int, transcriber: SpeechTranscriber | None = None) -
         f"Diarization: {diarization_backend}\n"
         f"Speakers: {speakers_label}\n\n"
         f"Post-process model: {_postprocess_model_label(post_model)}\n\n"
-        "RU: Отправьте MP3/аудио/voice, и я сделаю транскрипт.\n"
-        "EN: Send MP3/audio/voice and I will transcribe it."
+        "RU: Отправьте MP3/аудио/voice или MP4-видео, и я сделаю транскрипт.\n"
+        "EN: Send MP3/audio/voice or MP4 video and I will transcribe it."
     )
 
 
@@ -397,21 +398,35 @@ async def _safe_query_edit_message_text(
     return False
 
 
-def _extract_file_info(update: Update) -> tuple[str, str]:
+def _extract_file_info(update: Update) -> tuple[str, str, str]:
     message = update.effective_message
     if message is None:
         raise ValueError("No message to process.")
 
     if message.audio:
         ext = Path(message.audio.file_name or "audio.mp3").suffix or ".mp3"
-        return message.audio.file_id, ext
+        return message.audio.file_id, ext, "audio"
     if message.voice:
-        return message.voice.file_id, ".ogg"
+        return message.voice.file_id, ".ogg", "voice"
+    if message.video:
+        ext = Path(message.video.file_name or "video.mp4").suffix or ".mp4"
+        return message.video.file_id, ext, "video"
     if message.document:
-        ext = Path(message.document.file_name or "audio.bin").suffix or ".bin"
-        return message.document.file_id, ext
+        default_name = "media.bin"
+        mime = (message.document.mime_type or "").strip().lower()
+        media_kind = "document"
+        if mime.startswith("video/"):
+            default_name = "video.mp4"
+            media_kind = "video"
+        elif mime.startswith("audio/"):
+            default_name = "audio.bin"
+            media_kind = "audio"
+        ext = Path(message.document.file_name or default_name).suffix or Path(default_name).suffix or ".bin"
+        if ext.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+            media_kind = "video"
+        return message.document.file_id, ext, media_kind
 
-    raise ValueError("No supported audio payload found.")
+    raise ValueError("No supported audio/video payload found.")
 
 
 def _extract_file_size(update: Update) -> int:
@@ -422,6 +437,8 @@ def _extract_file_size(update: Update) -> int:
         return int(message.audio.file_size)
     if message.voice and message.voice.file_size:
         return int(message.voice.file_size)
+    if message.video and message.video.file_size:
+        return int(message.video.file_size)
     if message.document and message.document.file_size:
         return int(message.document.file_size)
     return 0
@@ -493,6 +510,36 @@ def _telegram_download_limit_bytes() -> int:
 
 def _size_to_mb_text(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _extract_audio_track_from_video(input_video: Path, output_audio: Path) -> None:
+    ffmpeg_bin = os.getenv("FFMPEG_BINARY", "ffmpeg").strip() or "ffmpeg"
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        str(input_video),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(output_audio),
+    ]
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip()[-1200:]
+        raise RuntimeError(f"ffmpeg audio extraction failed (code={proc.returncode}): {stderr_tail}")
+    if not output_audio.exists() or output_audio.stat().st_size <= 0:
+        raise RuntimeError("ffmpeg audio extraction produced empty output file.")
 
 
 def _local_api_host() -> str:
@@ -895,23 +942,25 @@ async def _send_text_or_file(
     filename: str,
     short_prefix: str = "",
     caption: str,
+    force_file: bool = False,
 ) -> None:
     payload = text.strip()
     if not payload:
         payload = "(empty)"
-    chunks = _split_for_telegram(payload)
-    if len(chunks) <= 8:
-        for idx, chunk in enumerate(chunks, start=1):
-            if len(chunks) == 1:
-                body = chunk
-                if short_prefix:
-                    body = f"{short_prefix}\n{chunk}"
-            else:
-                body = f"[Part {idx}/{len(chunks)}]\n{chunk}"
-                if short_prefix and idx == 1:
-                    body = f"{short_prefix}\n{body}"
-            await message.reply_text(body)
-        return
+    if not force_file:
+        chunks = _split_for_telegram(payload)
+        if len(chunks) <= 8:
+            for idx, chunk in enumerate(chunks, start=1):
+                if len(chunks) == 1:
+                    body = chunk
+                    if short_prefix:
+                        body = f"{short_prefix}\n{chunk}"
+                else:
+                    body = f"[Part {idx}/{len(chunks)}]\n{chunk}"
+                    if short_prefix and idx == 1:
+                        body = f"{short_prefix}\n{body}"
+                await message.reply_text(body)
+            return
 
     payload_bytes = io.BytesIO(payload.encode("utf-8"))
     payload_bytes.seek(0)
@@ -1076,7 +1125,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
     await message.reply_text(
-        "Send me an MP3/audio file and I will convert speech to text.\n"
+        "Send me an MP3/audio file or MP4 video and I will convert speech to text.\n"
         "Use /help for interactive settings menu.\n"
         "Send a text document (.txt/.md/.log/.json) to run debug cleanup+summary mode.\n"
         "Use /gpu to check CUDA/CPU runtime status.\n"
@@ -1107,7 +1156,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/speakers auto|2|3|4\n"
         "/gpu - show runtime device status\n\n"
         "/llm - show LM Studio post-processing status\n\n"
-        "Send audio as voice, audio, or file attachment.\n"
+        "Send audio/video as voice, audio, video, or file attachment.\n"
         "Debug text mode: send text file (.txt/.md/.log/.json) for cleanup + summary."
     )
     await _send_menu(message, user.id, transcriber)
@@ -1131,13 +1180,13 @@ async def text_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
     await message.reply_text(
         "RU:\n"
-        "Я распознаю речь из аудио файлов.\n"
-        "Пожалуйста, отправьте MP3/аудио/voice-сообщение.\n"
+        "Я распознаю речь из аудио/видео файлов.\n"
+        "Пожалуйста, отправьте MP3/аудио/voice-сообщение или MP4-видео.\n"
         "Для debug-режима можно отправить текстовый файл (.txt/.md/.log/.json): "
         "я отдельно сделаю очистку и summary.\n\n"
         "EN:\n"
-        "I transcribe speech from audio files.\n"
-        "Please send an MP3/audio/voice message.\n"
+        "I transcribe speech from audio/video files.\n"
+        "Please send an MP3/audio/voice message or MP4 video.\n"
         "For debug mode you can send a text file (.txt/.md/.log/.json): "
         "I will run separate cleanup and summary.\n\n"
         "Use /help for settings."
@@ -1614,7 +1663,7 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
-        file_id, file_ext = _extract_file_info(update)
+        file_id, file_ext, media_kind = _extract_file_info(update)
         tg_file = None
         direct_source: Path | None = None
 
@@ -1743,6 +1792,29 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         raise
             else:
                 raise RuntimeError("No source available to download input audio file.")
+            transcribe_input_path = input_path
+            should_extract_audio = media_kind == "video" or file_ext.lower() in SUPPORTED_VIDEO_EXTENSIONS
+            if should_extract_audio:
+                with state_lock:
+                    progress_state.update(
+                        {
+                            "stage": "finalizing",
+                            "message": "Extracting audio track from video...",
+                        }
+                    )
+                await progress.edit_text("Extracting audio track from video...")
+                extracted_audio_path = tmp_path / "input_extracted.wav"
+                await asyncio.to_thread(
+                    _extract_audio_track_from_video,
+                    input_path,
+                    extracted_audio_path,
+                )
+                transcribe_input_path = extracted_audio_path
+                logger.info(
+                    "Extracted audio track from video: %s -> %s",
+                    input_path,
+                    extracted_audio_path,
+                )
 
             with state_lock:
                 progress_state.update(
@@ -1770,7 +1842,7 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             result = await asyncio.to_thread(
                 transcriber.transcribe_file,
-                input_path,
+                transcribe_input_path,
                 language,
                 quality,
                 output_format,
@@ -1778,6 +1850,8 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 _progress_callback,
             )
             postprocess_note = ""
+            summary_note = "\nSummary: not generated"
+            summary_text = ""
             postprocessor: TextPostProcessor | None = context.application.bot_data.get("postprocessor")
             if postprocessor is not None and postprocessor.enabled:
                 with state_lock:
@@ -1813,6 +1887,22 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         f"\nPost-processing model: {_postprocess_model_label(post_model)}"
                         f"\nPost-processing: {post_report.method}"
                     )
+                with state_lock:
+                    progress_state.update(
+                        {
+                            "stage": "finalizing",
+                            "message": "Generating summary...",
+                        }
+                    )
+                summary_text, summary_report = await asyncio.to_thread(
+                    postprocessor.summarize_text,
+                    result.text,
+                    result.language,
+                    post_model,
+                )
+                summary_note = f"\nSummary: {summary_report.method}"
+                if summary_report.error:
+                    summary_note = f"\nSummary: {summary_report.method} ({summary_report.error})"
             stop_event.set()
             if updater_task is not None:
                 await updater_task
@@ -1837,23 +1927,24 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"Chunks used: {result.chunk_count}"
                 f"{nemo_note}"
                 f"{postprocess_note}"
+                f"{summary_note}"
             )
 
-            chunks = _split_for_telegram(result.text)
-            if len(chunks) <= 8:
-                await progress.edit_text(summary)
-                for i, chunk in enumerate(chunks, start=1):
-                    if len(chunks) == 1:
-                        await message.reply_text(chunk)
-                    else:
-                        await message.reply_text(f"[Part {i}/{len(chunks)}]\n{chunk}")
-            else:
-                transcript_bytes = io.BytesIO(result.text.encode("utf-8"))
-                transcript_bytes.seek(0)
-                await progress.edit_text(summary)
-                await message.reply_document(
-                    document=InputFile(transcript_bytes, filename="transcript.txt"),
-                    caption="Transcript was long, sending as file.",
+            await progress.edit_text(summary)
+            await _send_text_or_file(
+                message,
+                result.text,
+                filename="transcript.txt",
+                caption="Transcript attached as file.",
+                force_file=True,
+            )
+            if summary_text.strip():
+                await _send_text_or_file(
+                    message,
+                    summary_text,
+                    filename="summary.txt",
+                    short_prefix="Summary:",
+                    caption="Summary was long, sending as file.",
                 )
     except Exception as exc:  # pylint: disable=broad-except
         stop_event.set()
@@ -2018,13 +2109,13 @@ def main() -> None:
     )
     app.add_handler(
         MessageHandler(
-            filters.AUDIO | filters.VOICE | filters.Document.AUDIO,
+            filters.AUDIO | filters.VOICE | filters.VIDEO | filters.Document.AUDIO | filters.Document.VIDEO,
             transcribe_audio,
         )
     )
     app.add_handler(
         MessageHandler(
-            filters.Document.ALL & (~filters.Document.AUDIO),
+            filters.Document.ALL & (~filters.Document.AUDIO) & (~filters.Document.VIDEO),
             debug_text_document,
         )
     )

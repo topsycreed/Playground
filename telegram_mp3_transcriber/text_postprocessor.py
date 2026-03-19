@@ -32,7 +32,7 @@ DEFAULT_PROMPTS: dict[str, Any] = {
         "3) Remove filler, repetitions, stutters, interjections, verbal noise (e.g. 'nu', 'kak by', duplicated fragments) while preserving key meaning.\n"
         "4) Keep technical terms correct and consistent (REST API, CI/CD, GitLab CI, RabbitMQ, Kafka, QA Lead, SDET, Automation QA, Vue.js, Selenium, XPath).\n"
         "5) If dialogue format, keep one line per speaker: \"Speaker: text\".\n"
-        "6) Speaker labels policy: use only provided replacements; if replacement map is empty or a speaker has no mapping, keep original labels exactly (User1, User2, ...); never invent speaker names.\n"
+        "6) Speaker labels policy: use only provided replacements. If a replacement does not look like a real person name (common word/job title/random token), ignore it and keep original labels exactly (User1, User2, ...); never invent speaker names.\n"
         "7) Do not invent details. If uncertain, keep original meaning conservatively.\n"
         "8) Return ONLY the edited transcript text, no explanations.\n\n"
         "Transcript chunk:\n"
@@ -82,6 +82,12 @@ class PostprocessReport:
     applied: bool
     method: str
     renamed_speakers: dict[str, str]
+    error: str = ""
+
+
+@dataclass
+class SummaryReport:
+    method: str
     error: str = ""
 
 
@@ -310,13 +316,40 @@ class TextPostProcessor:
         User1: Привет, меня зовут Иван
         User2: Hi, my name is John
         """
+
+        def _is_probable_person_name(name: str) -> bool:
+            candidate = name.strip()
+            if not candidate:
+                return False
+            if not re.fullmatch(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё-]{1,39}", candidate):
+                return False
+            lowered = candidate.lower()
+            blocked = {
+                "привет",
+                "сегодня",
+                "завтра",
+                "тест",
+                "qa",
+                "sdet",
+                "automation",
+                "engineer",
+                "lead",
+                "компания",
+                "стартап",
+                "работаю",
+                "живу",
+                "москве",
+                "москва",
+            }
+            if lowered in blocked:
+                return False
+            if candidate.isupper() and len(candidate) > 3:
+                return False
+            return True
+
         patterns = [
             re.compile(
                 r"\b\u043c\u0435\u043d\u044f \u0437\u043e\u0432\u0443\u0442\s+([A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451-]{2,40})",
-                re.IGNORECASE,
-            ),
-            re.compile(
-                r"\b\u044d\u0442\u043e\s+([A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451-]{2,40})",
                 re.IGNORECASE,
             ),
             re.compile(r"\bmy name is\s+([A-Za-z-]{2,40})", re.IGNORECASE),
@@ -338,6 +371,8 @@ class TextPostProcessor:
                     continue
                 name = m.group(1).strip(".,!?;: ")
                 if not name:
+                    continue
+                if not _is_probable_person_name(name):
                     continue
                 result[speaker] = name
                 break
@@ -1260,6 +1295,77 @@ class TextPostProcessor:
                 error=str(exc),
             )
 
+    def summarize_text(
+        self,
+        text: str,
+        language_hint: str = "auto",
+        model_choice: str = "gemini",
+    ) -> tuple[str, SummaryReport]:
+        started_at = time.perf_counter()
+        if not text.strip():
+            return "No content.", SummaryReport(method="none")
+
+        selected_model = (model_choice or "gemini").strip().lower()
+        if selected_model not in {"gemini", "whisper", "oos20"}:
+            selected_model = "gemini"
+
+        if selected_model == "whisper":
+            summary = self._summarize_text_heuristic(text)
+            logger.info(
+                "Summary finished via heuristic in %.1fs (summary_chars=%s).",
+                time.perf_counter() - started_at,
+                len(summary),
+            )
+            return summary, SummaryReport(method="heuristic")
+
+        try:
+            if selected_model == "gemini":
+                summary = self._summarize_text_with_gemini(text, language_hint)
+                logger.info(
+                    "Summary finished via Gemini in %.1fs (summary_chars=%s).",
+                    time.perf_counter() - started_at,
+                    len(summary),
+                )
+                return summary, SummaryReport(method="gemini")
+
+            summary = self._summarize_text_with_lmstudio(text, language_hint)
+            logger.info(
+                "Summary finished via LM Studio in %.1fs (summary_chars=%s).",
+                time.perf_counter() - started_at,
+                len(summary),
+            )
+            return summary, SummaryReport(method="lmstudio")
+        except (RuntimeError, TimeoutError, urllib_error.URLError, urllib_error.HTTPError, json.JSONDecodeError) as exc:
+            if selected_model == "gemini":
+                logger.warning("Text summary via Gemini failed: %s", exc)
+                if self._is_gemini_quota_error(exc) and self.gemini_fallback_model == "oos20":
+                    logger.warning("Gemini summary quota/rate limit detected. Falling back to oos20 summary.")
+                    try:
+                        summary = self._summarize_text_with_lmstudio(text, language_hint)
+                        return summary, SummaryReport(method="lmstudio-fallback", error=str(exc))
+                    except (
+                        RuntimeError,
+                        TimeoutError,
+                        urllib_error.URLError,
+                        urllib_error.HTTPError,
+                        json.JSONDecodeError,
+                    ) as lm_exc:
+                        logger.warning("oos20 summary fallback failed: %s", lm_exc)
+                        summary = self._summarize_text_heuristic(text)
+                        return summary, SummaryReport(
+                            method="heuristic-fallback",
+                            error=f"{exc}; oos20 summary fallback: {lm_exc}",
+                        )
+            else:
+                logger.warning("Text summary via LM Studio failed: %s", exc)
+            summary = self._summarize_text_heuristic(text)
+            logger.info(
+                "Summary finished with heuristic fallback in %.1fs (summary_chars=%s).",
+                time.perf_counter() - started_at,
+                len(summary),
+            )
+            return summary, SummaryReport(method="heuristic-fallback", error=str(exc))
+
     def process_debug_text(
         self,
         text: str,
@@ -1296,90 +1402,34 @@ class TextPostProcessor:
                 error=cleanup_report.error,
             )
 
-        summary_engine = selected_model
+        summary_model = selected_model
         if cleanup_report.method == "lmstudio":
-            summary_engine = "oos20"
+            summary_model = "oos20"
         if cleanup_report.method.startswith("whisper"):
-            summary_engine = "whisper"
+            summary_model = "whisper"
         if cleanup_report.method == "heuristic-fallback":
-            summary_engine = "whisper"
+            summary_model = "whisper"
 
-        if summary_engine == "whisper":
-            summary = self._summarize_text_heuristic(cleaned_text)
-            logger.info(
-                "Debug text summary finished via heuristic in %.1fs (summary_chars=%s).",
-                time.perf_counter() - started_at,
-                len(summary),
-            )
-            return cleaned_text, summary, DebugTextReport(
-                cleanup_method=cleanup_report.method,
-                summary_method="heuristic",
-                error=cleanup_report.error,
-            )
-
-        try:
-            if summary_engine == "gemini":
-                summary = self._summarize_text_with_gemini(cleaned_text, language_hint)
-            else:
-                summary = self._summarize_text_with_lmstudio(cleaned_text, language_hint)
-            logger.info(
-                "Debug text processing finished via %s in %.1fs (summary_chars=%s).",
-                "Gemini" if summary_engine == "gemini" else "LM Studio",
-                time.perf_counter() - started_at,
-                len(summary),
-            )
-            return cleaned_text, summary, DebugTextReport(
-                cleanup_method=cleanup_report.method,
-                summary_method="gemini" if summary_engine == "gemini" else "lmstudio",
-                error=cleanup_report.error,
-            )
-        except (RuntimeError, TimeoutError, urllib_error.URLError, urllib_error.HTTPError, json.JSONDecodeError) as exc:
-            if summary_engine == "gemini":
-                logger.warning("Text summary via Gemini failed: %s", exc)
-                if self._is_gemini_quota_error(exc) and self.gemini_fallback_model == "oos20":
-                    logger.warning("Gemini summary quota/rate limit detected. Falling back to oos20 summary.")
-                    try:
-                        summary = self._summarize_text_with_lmstudio(cleaned_text, language_hint)
-                        return cleaned_text, summary, DebugTextReport(
-                            cleanup_method=cleanup_report.method,
-                            summary_method="lmstudio-fallback",
-                            error=cleanup_report.error,
-                        )
-                    except (
-                        RuntimeError,
-                        TimeoutError,
-                        urllib_error.URLError,
-                        urllib_error.HTTPError,
-                        json.JSONDecodeError,
-                    ) as lm_exc:
-                        logger.warning("oos20 summary fallback failed: %s", lm_exc)
-                        summary = self._summarize_text_heuristic(cleaned_text)
-                        merged_error = cleanup_report.error
-                        if merged_error:
-                            merged_error = f"{merged_error}; summary: {exc}; oos20 summary fallback: {lm_exc}"
-                        else:
-                            merged_error = f"summary: {exc}; oos20 summary fallback: {lm_exc}"
-                        return cleaned_text, summary, DebugTextReport(
-                            cleanup_method=cleanup_report.method,
-                            summary_method="heuristic-fallback",
-                            error=merged_error,
-                        )
-            else:
-                logger.warning("Text summary via LM Studio failed: %s", exc)
-            summary = self._summarize_text_heuristic(cleaned_text)
-            merged_error = cleanup_report.error
+        summary, summary_report = self.summarize_text(
+            cleaned_text,
+            language_hint=language_hint,
+            model_choice=summary_model,
+        )
+        merged_error = cleanup_report.error
+        if summary_report.error:
             if merged_error:
-                merged_error = f"{merged_error}; summary: {exc}"
+                merged_error = f"{merged_error}; summary: {summary_report.error}"
             else:
-                merged_error = f"summary: {exc}"
-            logger.info(
-                "Debug text processing finished with summary fallback in %.1fs (summary_chars=%s).",
-                time.perf_counter() - started_at,
-                len(summary),
-            )
-            return cleaned_text, summary, DebugTextReport(
-                cleanup_method=cleanup_report.method,
-                summary_method="heuristic-fallback",
-                error=merged_error,
-            )
+                merged_error = f"summary: {summary_report.error}"
+        logger.info(
+            "Debug text processing finished in %.1fs (summary_method=%s, summary_chars=%s).",
+            time.perf_counter() - started_at,
+            summary_report.method,
+            len(summary),
+        )
+        return cleaned_text, summary, DebugTextReport(
+            cleanup_method=cleanup_report.method,
+            summary_method=summary_report.method,
+            error=merged_error,
+        )
 
