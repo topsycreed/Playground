@@ -5,6 +5,7 @@
 ```powershell
 cd .\telegram_mp3_transcriber\
 .\.venv312\Scripts\Activate.ps1
+pip install -r requirements.txt
 python bot.py
 ```
 
@@ -17,6 +18,7 @@ Features:
 - Output formats: plain text or dialogue (`User1` / `User2`)
 - Input support: `audio`, `voice`, `video`, file attachments (`Document.AUDIO` / `Document.VIDEO`)
 - MP4/video pipeline: audio track is extracted with `ffmpeg` and then transcribed
+- YouTube URL mode: send `https://www.youtube.com/watch?v=...` and bot downloads audio for transcription
 - Hybrid mode: Whisper transcription + optional NeMo diarization backend
 - Optional LLM post-processing:
   - Google Gemini (AI Studio free tier)
@@ -46,6 +48,7 @@ Recommended (GPU mode, better speed/quality):
 - Python 3.10+ for Whisper bot
 - Internet access on first model download
 - Telegram bot token from `@BotFather`
+- `yt-dlp` Python package for YouTube URL mode (included in `requirements.txt`)
 
 For CUDA mode only:
 - NVIDIA driver (latest stable)
@@ -231,6 +234,7 @@ They are cached locally, so re-download is not needed every start (unless cache 
 ## 7) Use Bot in Telegram
 
 - Send MP3/audio/voice or MP4 video
+- Or send a YouTube URL (`https://www.youtube.com/watch?v=...`)
 - Or send a text document (`.txt/.md/.log/.json/.csv/.yaml/.xml/.srt/.vtt`) for debug cleanup+summary
 - For audio/video requests bot returns:
   - status message (`Done...`)
@@ -374,6 +378,10 @@ Bot hangs on startup around `import transformers` / `ctranslate2`
 - Ensure `ffmpeg.exe` is available in `PATH` (`where.exe ffmpeg`)
 - If needed, set `FFMPEG_EXTRA_PATHS` in `.env`
 - Retry with a video that has an actual audio track
+
+`yt-dlp is not installed`
+- Install/update dependencies: `pip install -r requirements.txt`
+- Or install directly: `pip install yt-dlp`
 
 Summary is missing after transcription
 - Ensure `TEXT_POSTPROCESS_ENABLED=true`

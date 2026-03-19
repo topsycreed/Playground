@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import socket
@@ -29,6 +30,10 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+try:
+    from yt_dlp import YoutubeDL
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    YoutubeDL = None
 
 from transcriber import SpeechTranscriber
 from text_postprocessor import TextPostProcessor
@@ -262,8 +267,8 @@ def _settings_text(user_id: int, transcriber: SpeechTranscriber | None = None) -
         f"Diarization: {diarization_backend}\n"
         f"Speakers: {speakers_label}\n\n"
         f"Post-process model: {_postprocess_model_label(post_model)}\n\n"
-        "RU: Отправьте MP3/аудио/voice или MP4-видео, и я сделаю транскрипт.\n"
-        "EN: Send MP3/audio/voice or MP4 video and I will transcribe it."
+        "RU: Отправьте MP3/аудио/voice, MP4-видео или YouTube-ссылку, и я сделаю транскрипт.\n"
+        "EN: Send MP3/audio/voice, MP4 video, or YouTube URL and I will transcribe it."
     )
 
 
@@ -510,6 +515,60 @@ def _telegram_download_limit_bytes() -> int:
 
 def _size_to_mb_text(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _find_youtube_url_in_text(text: str) -> str | None:
+    if not text.strip():
+        return None
+    # Keep detection simple and robust for message text with extra words.
+    url_pattern = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
+    for raw_url in url_pattern.findall(text):
+        candidate = raw_url.rstrip(".,!?;:)]}>'\"")
+        try:
+            parsed = urllib_parse.urlsplit(candidate)
+        except ValueError:
+            continue
+        host = (parsed.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        is_youtube = host in {"youtube.com", "m.youtube.com", "youtu.be"} or host.endswith(".youtube.com")
+        if is_youtube:
+            return candidate
+    return None
+
+
+def _download_audio_from_youtube(url: str, output_dir: Path) -> tuple[Path, str]:
+    if YoutubeDL is None:
+        raise RuntimeError("yt-dlp is not installed. Install dependency: pip install yt-dlp")
+
+    output_template = str(output_dir / "youtube_audio.%(ext)s")
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": output_template,
+        "restrictfilenames": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info is None:
+            raise RuntimeError("yt-dlp did not return media info.")
+        if "entries" in info and info["entries"]:
+            info = info["entries"][0]
+        downloaded_path = Path(ydl.prepare_filename(info))
+
+    if not downloaded_path.exists():
+        candidates = sorted(output_dir.glob("youtube_audio.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise RuntimeError("yt-dlp finished but downloaded audio file was not found.")
+        downloaded_path = candidates[0]
+
+    title = str(info.get("title") or "").strip() if isinstance(info, dict) else ""
+    return downloaded_path, title
 
 
 def _extract_audio_track_from_video(input_video: Path, output_audio: Path) -> None:
@@ -1028,6 +1087,120 @@ async def _progress_message_updater(
             logger.debug("Progress updater failed: %s", exc)
 
 
+async def _finalize_and_send_transcription_result(
+    *,
+    message,
+    progress,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    transcriber: SpeechTranscriber,
+    result,
+    quality: str,
+    output_format: str,
+    speaker_mode: int,
+    post_model: str,
+    state_lock: threading.Lock | None = None,
+    progress_state: dict[str, object] | None = None,
+) -> None:
+    postprocess_note = ""
+    summary_note = "\nSummary: not generated"
+    summary_text = ""
+    postprocessor: TextPostProcessor | None = context.application.bot_data.get("postprocessor")
+    if postprocessor is not None and postprocessor.enabled:
+        if state_lock is not None and progress_state is not None:
+            with state_lock:
+                progress_state.update(
+                    {
+                        "stage": "finalizing",
+                        "message": "Post-processing transcript text...",
+                    }
+                )
+        processed_text, post_report = await asyncio.to_thread(
+            postprocessor.process_text,
+            result.text,
+            result.language,
+            output_format,
+            post_model,
+        )
+        result.text = processed_text
+        if post_report.applied:
+            rename_info = ""
+            if post_report.renamed_speakers:
+                rename_info = f", renamed speakers: {len(post_report.renamed_speakers)}"
+            postprocess_note = (
+                f"\nPost-processing model: {_postprocess_model_label(post_model)}"
+                f"\nPost-processing: {post_report.method}{rename_info}"
+            )
+        elif post_report.error:
+            postprocess_note = (
+                f"\nPost-processing model: {_postprocess_model_label(post_model)}"
+                f"\nPost-processing fallback: {post_report.method} ({post_report.error})"
+            )
+        else:
+            postprocess_note = (
+                f"\nPost-processing model: {_postprocess_model_label(post_model)}"
+                f"\nPost-processing: {post_report.method}"
+            )
+
+        if state_lock is not None and progress_state is not None:
+            with state_lock:
+                progress_state.update(
+                    {
+                        "stage": "finalizing",
+                        "message": "Generating summary...",
+                    }
+                )
+        summary_text, summary_report = await asyncio.to_thread(
+            postprocessor.summarize_text,
+            result.text,
+            result.language,
+            post_model,
+        )
+        summary_note = f"\nSummary: {summary_report.method}"
+        if summary_report.error:
+            summary_note = f"\nSummary: {summary_report.method} ({summary_report.error})"
+
+    runtime = transcriber.status()
+    format_note = output_format
+    if output_format == "dialog" and result.speaker_count <= 1:
+        format_note = "dialog (auto-switched to plain text: 1 speaker)"
+    nemo_note = ""
+    if runtime.get("nemo_available") is False:
+        reason = runtime.get("nemo_reason") or "NeMo is unavailable."
+        nemo_note = f"\nNeMo status: unavailable ({reason})"
+    summary = (
+        f"Done.\n"
+        f"Detected language: {result.language}\n"
+        f"Speakers detected: {result.speaker_count}\n"
+        f"Diarization backend: {result.diarization_backend}\n"
+        f"Speaker mode: {'auto' if speaker_mode == 0 else speaker_mode}\n"
+        f"Quality mode: {quality}\n"
+        f"Format: {format_note}\n"
+        f"Device: {runtime['active_device']}\n"
+        f"Chunks used: {result.chunk_count}"
+        f"{nemo_note}"
+        f"{postprocess_note}"
+        f"{summary_note}"
+    )
+
+    await progress.edit_text(summary)
+    await _send_text_or_file(
+        message,
+        result.text,
+        filename="transcript.txt",
+        caption="Transcript attached as file.",
+        force_file=True,
+    )
+    if summary_text.strip():
+        await _send_text_or_file(
+            message,
+            summary_text,
+            filename="summary.txt",
+            short_prefix="Summary:",
+            caption="Summary was long, sending as file.",
+        )
+
+
 def _format_gpu_status(transcriber: SpeechTranscriber) -> str:
     status = transcriber.status()
     cublas = _find_dll_on_path("cublas64_12.dll") or "not found"
@@ -1125,7 +1298,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
     await message.reply_text(
-        "Send me an MP3/audio file or MP4 video and I will convert speech to text.\n"
+        "Send me an MP3/audio file, MP4 video, or YouTube URL and I will convert speech to text.\n"
         "Use /help for interactive settings menu.\n"
         "Send a text document (.txt/.md/.log/.json) to run debug cleanup+summary mode.\n"
         "Use /gpu to check CUDA/CPU runtime status.\n"
@@ -1156,7 +1329,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/speakers auto|2|3|4\n"
         "/gpu - show runtime device status\n\n"
         "/llm - show LM Studio post-processing status\n\n"
-        "Send audio/video as voice, audio, video, or file attachment.\n"
+        "Send audio/video as voice, audio, video, file attachment, or YouTube URL.\n"
         "Debug text mode: send text file (.txt/.md/.log/.json) for cleanup + summary."
     )
     await _send_menu(message, user.id, transcriber)
@@ -1171,10 +1344,146 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _send_menu(message, user.id, transcriber)
 
 
+async def transcribe_youtube_url(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    youtube_url: str,
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    transcriber: SpeechTranscriber = context.application.bot_data["transcriber"]
+    language = _get_user_language(user.id)
+    quality = _get_user_quality(user.id)
+    output_format = _get_user_format(user.id)
+    speaker_mode = _get_user_speakers(user.id, transcriber)
+    post_model = _get_user_postprocess_model(user.id)
+
+    progress = await message.reply_text("YouTube mode: downloading audio...")
+    state_lock = threading.Lock()
+    progress_state: dict[str, object] = {
+        "stage": "download",
+        "message": "Downloading audio from YouTube...",
+        "done_chunks": 0,
+        "total_chunks": 0,
+    }
+    stop_event = asyncio.Event()
+    updater_task: asyncio.Task | None = None
+    try:
+        if YoutubeDL is None:
+            await progress.edit_text(
+                "RU:\n"
+                "Поддержка YouTube не установлена: нужен пакет `yt-dlp`.\n"
+                "Установите: pip install yt-dlp\n\n"
+                "EN:\n"
+                "YouTube support is not installed: `yt-dlp` package is required.\n"
+                "Install: pip install yt-dlp"
+            )
+            return
+
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            media_path, video_title = await asyncio.to_thread(
+                _download_audio_from_youtube,
+                youtube_url,
+                tmp_path,
+            )
+            logger.info(
+                "YouTube audio downloaded: url=%s title=%s path=%s size=%s",
+                youtube_url,
+                video_title or "(unknown)",
+                media_path,
+                _size_to_mb_text(media_path.stat().st_size),
+            )
+
+            transcribe_input_path = media_path
+            if media_path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+                with state_lock:
+                    progress_state.update(
+                        {
+                            "stage": "finalizing",
+                            "message": "Extracting audio track from downloaded video...",
+                        }
+                    )
+                await progress.edit_text("Extracting audio track from downloaded video...")
+                extracted_audio_path = tmp_path / "youtube_extracted.wav"
+                await asyncio.to_thread(
+                    _extract_audio_track_from_video,
+                    media_path,
+                    extracted_audio_path,
+                )
+                transcribe_input_path = extracted_audio_path
+
+            with state_lock:
+                progress_state.update(
+                    {
+                        "stage": "model_loading" if not transcriber.is_model_loaded() else "transcribing",
+                        "message": (
+                            "Preparing model for first run..."
+                            if not transcriber.is_model_loaded()
+                            else "Transcription started..."
+                        ),
+                        "done_chunks": 0,
+                        "total_chunks": 0,
+                    }
+                )
+            title_note = f" title={video_title}" if video_title else ""
+            await progress.edit_text(
+                f"Processing YouTube audio...{title_note} (quality={quality}, language={language}, format={output_format})"
+            )
+            updater_task = asyncio.create_task(
+                _progress_message_updater(progress, progress_state, state_lock, stop_event)
+            )
+
+            def _progress_callback(payload: dict[str, object]) -> None:
+                with state_lock:
+                    progress_state.update(payload)
+
+            result = await asyncio.to_thread(
+                transcriber.transcribe_file,
+                transcribe_input_path,
+                language,
+                quality,
+                output_format,
+                speaker_mode,
+                _progress_callback,
+            )
+            stop_event.set()
+            if updater_task is not None:
+                await updater_task
+
+            await _finalize_and_send_transcription_result(
+                message=message,
+                progress=progress,
+                context=context,
+                user_id=user.id,
+                transcriber=transcriber,
+                result=result,
+                quality=quality,
+                output_format=output_format,
+                speaker_mode=speaker_mode,
+                post_model=post_model,
+                state_lock=state_lock,
+                progress_state=progress_state,
+            )
+    except Exception as exc:  # pylint: disable=broad-except
+        stop_event.set()
+        if updater_task is not None:
+            await updater_task
+        logger.exception("Failed to process YouTube URL: %s", youtube_url)
+        await progress.edit_text(f"Error: {exc}")
+
+
 async def text_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
     if message is None or user is None:
+        return
+    text_payload = (message.text or "").strip()
+    youtube_url = _find_youtube_url_in_text(text_payload)
+    if youtube_url:
+        await transcribe_youtube_url(update, context, youtube_url)
         return
 
     transcriber: SpeechTranscriber | None = context.application.bot_data.get("transcriber")
@@ -1182,11 +1491,13 @@ async def text_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "RU:\n"
         "Я распознаю речь из аудио/видео файлов.\n"
         "Пожалуйста, отправьте MP3/аудио/voice-сообщение или MP4-видео.\n"
+        "Или отправьте ссылку на YouTube видео.\n"
         "Для debug-режима можно отправить текстовый файл (.txt/.md/.log/.json): "
         "я отдельно сделаю очистку и summary.\n\n"
         "EN:\n"
         "I transcribe speech from audio/video files.\n"
         "Please send an MP3/audio/voice message or MP4 video.\n"
+        "Or send a YouTube video URL.\n"
         "For debug mode you can send a text file (.txt/.md/.log/.json): "
         "I will run separate cleanup and summary.\n\n"
         "Use /help for settings."
@@ -1849,103 +2160,23 @@ async def transcribe_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 speaker_mode,
                 _progress_callback,
             )
-            postprocess_note = ""
-            summary_note = "\nSummary: not generated"
-            summary_text = ""
-            postprocessor: TextPostProcessor | None = context.application.bot_data.get("postprocessor")
-            if postprocessor is not None and postprocessor.enabled:
-                with state_lock:
-                    progress_state.update(
-                        {
-                            "stage": "finalizing",
-                            "message": "Post-processing transcript text...",
-                        }
-                    )
-                processed_text, post_report = await asyncio.to_thread(
-                    postprocessor.process_text,
-                    result.text,
-                    result.language,
-                    output_format,
-                    post_model,
-                )
-                result.text = processed_text
-                if post_report.applied:
-                    rename_info = ""
-                    if post_report.renamed_speakers:
-                        rename_info = f", renamed speakers: {len(post_report.renamed_speakers)}"
-                    postprocess_note = (
-                        f"\nPost-processing model: {_postprocess_model_label(post_model)}"
-                        f"\nPost-processing: {post_report.method}{rename_info}"
-                    )
-                elif post_report.error:
-                    postprocess_note = (
-                        f"\nPost-processing model: {_postprocess_model_label(post_model)}"
-                        f"\nPost-processing fallback: {post_report.method} ({post_report.error})"
-                    )
-                else:
-                    postprocess_note = (
-                        f"\nPost-processing model: {_postprocess_model_label(post_model)}"
-                        f"\nPost-processing: {post_report.method}"
-                    )
-                with state_lock:
-                    progress_state.update(
-                        {
-                            "stage": "finalizing",
-                            "message": "Generating summary...",
-                        }
-                    )
-                summary_text, summary_report = await asyncio.to_thread(
-                    postprocessor.summarize_text,
-                    result.text,
-                    result.language,
-                    post_model,
-                )
-                summary_note = f"\nSummary: {summary_report.method}"
-                if summary_report.error:
-                    summary_note = f"\nSummary: {summary_report.method} ({summary_report.error})"
             stop_event.set()
             if updater_task is not None:
                 await updater_task
-
-            runtime = transcriber.status()
-            format_note = output_format
-            if output_format == "dialog" and result.speaker_count <= 1:
-                format_note = "dialog (auto-switched to plain text: 1 speaker)"
-            nemo_note = ""
-            if runtime.get("nemo_available") is False:
-                reason = runtime.get("nemo_reason") or "NeMo is unavailable."
-                nemo_note = f"\nNeMo status: unavailable ({reason})"
-            summary = (
-                f"Done.\n"
-                f"Detected language: {result.language}\n"
-                f"Speakers detected: {result.speaker_count}\n"
-                f"Diarization backend: {result.diarization_backend}\n"
-                f"Speaker mode: {'auto' if speaker_mode == 0 else speaker_mode}\n"
-                f"Quality mode: {quality}\n"
-                f"Format: {format_note}\n"
-                f"Device: {runtime['active_device']}\n"
-                f"Chunks used: {result.chunk_count}"
-                f"{nemo_note}"
-                f"{postprocess_note}"
-                f"{summary_note}"
+            await _finalize_and_send_transcription_result(
+                message=message,
+                progress=progress,
+                context=context,
+                user_id=user.id,
+                transcriber=transcriber,
+                result=result,
+                quality=quality,
+                output_format=output_format,
+                speaker_mode=speaker_mode,
+                post_model=post_model,
+                state_lock=state_lock,
+                progress_state=progress_state,
             )
-
-            await progress.edit_text(summary)
-            await _send_text_or_file(
-                message,
-                result.text,
-                filename="transcript.txt",
-                caption="Transcript attached as file.",
-                force_file=True,
-            )
-            if summary_text.strip():
-                await _send_text_or_file(
-                    message,
-                    summary_text,
-                    filename="summary.txt",
-                    short_prefix="Summary:",
-                    caption="Summary was long, sending as file.",
-                )
     except Exception as exc:  # pylint: disable=broad-except
         stop_event.set()
         if updater_task is not None:
