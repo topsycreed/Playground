@@ -547,12 +547,16 @@ def _download_audio_from_youtube(url: str, output_dir: Path) -> tuple[Path, str]
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "color": "no_color",
         "outtmpl": output_template,
         "restrictfilenames": True,
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
     }
+    node_path = shutil.which("node")
+    if node_path:
+        ydl_opts["js_runtimes"] = {"deno": {}, "node": {"path": node_path}}
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         if info is None:

@@ -381,7 +381,8 @@ Bot hangs on startup around `import transformers` / `ctranslate2`
 
 `yt-dlp is not installed`
 - Install/update dependencies: `pip install -r requirements.txt`
-- Or install directly: `pip install yt-dlp`
+- Or install directly: `python -m pip install --upgrade "yt-dlp[default]"`
+- For YouTube HTTP 403 errors, run this upgrade in the bot's virtual environment and restart `python bot.py`.
 
 Summary is missing after transcription
 - Ensure `TEXT_POSTPROCESS_ENABLED=true`
