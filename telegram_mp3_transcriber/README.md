@@ -5,9 +5,14 @@
 ```powershell
 cd .\telegram_mp3_transcriber\
 .\.venv312\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python bot.py
 ```
+
+These commands activate the existing Python 3.12 environment. For first-time
+setup, create it with `py -3.12 -m venv .venv312`.
+Using `python -m pip` avoids the `pip.exe` launcher, which Windows application
+control may block. It does not bypass policies blocking Python or DLL files.
 
 This bot transcribes speech from Telegram audio/video files to text using `faster-whisper` (local inference, no paid API).
 
@@ -76,13 +81,13 @@ cd C:\Users\Gena\Documents\Playground\telegram_mp3_transcriber
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 Optional for NeMo diarization:
 
 ```powershell
-pip install -r requirements-nemo.txt
+python -m pip install -r requirements-nemo.txt
 ```
 
 If NeMo install fails in your current environment (common on Python 3.13+), create a Python 3.12 venv:
@@ -91,8 +96,8 @@ If NeMo install fails in your current environment (common on Python 3.13+), crea
 py -3.12 -m venv .venv312
 .venv312\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
-pip install -r requirements-nemo.txt
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-nemo.txt
 ```
 
 ## 3) Configure `.env`
@@ -353,6 +358,20 @@ Dialogue mode notes:
 
 ## Troubleshooting
 
+`pip.exe` is blocked by Windows application control
+
+From the bot directory, install dependencies through the environment's Python:
+
+```powershell
+.\.venv312\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv312\Scripts\python.exe bot.py
+```
+
+After activation, `python -m pip install -r requirements.txt` also works.
+If you use `.venv` instead of `.venv312`, substitute that path in the commands.
+If only the YouTube downloader needs updating, run `.\update_youtube.cmd`,
+then restart the bot; reinstalling all dependencies is unnecessary.
+
 `RuntimeError: cublas64_12.dll is not found`
 - Install CUDA Toolkit 12.x
 - Ensure CUDA `bin` path is in `PATH`
@@ -380,9 +399,9 @@ Bot hangs on startup around `import transformers` / `ctranslate2`
 - Retry with a video that has an actual audio track
 
 `yt-dlp is not installed`
-- Install/update dependencies: `pip install -r requirements.txt`
-- Or install directly: `python -m pip install --upgrade "yt-dlp[default]"`
-- For YouTube HTTP 403 errors, run this upgrade in the bot's virtual environment and restart `python bot.py`.
+- Install/update dependencies: `python -m pip install -r requirements.txt`
+- Or install directly: `python -m pip install --upgrade --pre "yt-dlp[default]"`
+- For YouTube HTTP 403 errors, run `update_youtube.cmd` from this directory. It updates the downloader and YouTube components in `.venv312`, including current nightly fixes. Restart `python bot.py` afterwards: a running bot keeps the old imported library.
 
 Summary is missing after transcription
 - Ensure `TEXT_POSTPROCESS_ENABLED=true`
